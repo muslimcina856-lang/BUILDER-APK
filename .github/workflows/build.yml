@@ -1,0 +1,67 @@
+name: Build Engine (Official API)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Source filename'
+        required: true
+        default: 'source.zip'
+      chat_id:
+        description: 'Telegram Chat ID'
+        required: true
+      bot_token:
+        description: 'Telegram Bot Token'
+        required: true
+      project_type:
+        description: 'Project Type'
+        required: true
+      user_display:
+        description: 'User display name'
+        required: true
+      in_progress:
+        description: 'Build in progress count'
+        required: true
+      channel_id:
+        description: 'Telegram Channel ID'
+        required: false
+      api_id:
+        description: 'Telethon API ID'
+        required: true
+      api_hash:
+        description: 'Telethon API Hash'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Environment
+        run: |
+          bash scripts/setup_android_sdk.sh
+          bash scripts/setup_apktool.sh
+          pip install -r server/requirements.txt
+          pip install telethon
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Build Worker
+        env:
+          BOT_TOKEN: ${{ github.event.inputs.bot_token }}
+          CHAT_ID: ${{ github.event.inputs.chat_id }}
+          CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          PROJECT_TYPE: ${{ github.event.inputs.project_type }}
+          USER_DISPLAY: ${{ github.event.inputs.user_display }}
+          IN_PROGRESS: ${{ github.event.inputs.in_progress }}
+          TARGET_FILE: ${{ github.event.inputs.target }}
+          API_ID: ${{ github.event.inputs.api_id }}
+          API_HASH: ${{ github.event.inputs.api_hash }}
+        run: |
+          python3 server/worker.py
