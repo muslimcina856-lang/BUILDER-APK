@@ -828,6 +828,43 @@ def _parse_agp_from_error(error_text):
     return highest
 
 
+def _parse_gradle_dist_error(error_text):
+    """
+    Detect kegagalan muat turun Gradle Wrapper distribution (cth. distributionUrl
+    projek tunjuk ke mirror pihak ketiga yang down/404/rosak).
+    Pulangkan (versi, jenis) cth ("8.14.0", "all") kalau jumpa, atau None.
+    Sengaja TAK trigger untuk kegagalan build/compile biasa — hanya untuk
+    kegagalan MUAT TURUN gradle itu sendiri (sebelum build sempat bermula).
+    """
+    if ("FileNotFoundException" not in error_text
+            and "Gradle threw an error while downloading artifacts" not in error_text):
+        return None
+    m = re.search(r'gradle-([0-9]+\.[0-9]+(?:\.[0-9]+)?)-(bin|all)\.zip', error_text)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _force_official_gradle_url(props_path, version, dist_type, logs):
+    """
+    Tulis semula distributionUrl ke host RASMI services.gradle.org, dengan
+    versi & jenis (bin/all) YANG SAMA seperti ditetapkan asal oleh developer
+    projek — cuma host yang ditukar, bukan versi. Dipanggil sebagai FALLBACK
+    sahaja selepas URL asal projek terbukti gagal dimuat turun.
+    """
+    try:
+        with open(props_path, "r", encoding="utf-8", errors="replace") as f:
+            pc = f.read()
+        new_url = f"https\\://services.gradle.org/distributions/gradle-{version}-{dist_type}.zip"
+        new_pc = re.sub(r"distributionUrl=.*", f"distributionUrl={new_url}", pc)
+        with open(props_path, "w", encoding="utf-8") as f:
+            f.write(new_pc)
+        logs.append(f"Auto-fix: Gradle {version} gagal dimuat turun dari sumber asal projek → tukar ke services.gradle.org")
+        return True
+    except Exception:
+        return False
+
+
 # ================================================================
 # MAIN FIX FUNCTIONS
 # ================================================================
@@ -1255,6 +1292,8 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
     Pass 1: Build terus.
     Pass 2 (kalau gagal): Detect NDK conflict dari error → fix → retry.
     Pass 3 (kalau masih gagal): Detect AGP conflict dari error → fix → pub get → retry.
+    Pass 4 (kalau masih gagal): Detect Gradle distribution gagal dimuat turun
+            (URL/mirror asal projek down/404) → tukar ke services.gradle.org → retry.
     """
     code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
     if code == 0:
@@ -1279,6 +1318,17 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
         await fix_flutter_versions(project_dir, logs, required_agp_override=agp_required)
         await run_cmd("flutter pub get", cwd=project_dir, timeout=300)
         code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
+        if code == 0:
+            return code, out, err
+        combined = (err or "") + (out or "")
+
+    # ── Retry 3: Gradle distribution gagal dimuat turun (mirror projek rosak) ──
+    gradle_dist_fail = _parse_gradle_dist_error(combined)
+    if gradle_dist_fail:
+        version, dist_type = gradle_dist_fail
+        props_path = os.path.join(android_dir, "gradle", "wrapper", "gradle-wrapper.properties")
+        if _force_official_gradle_url(props_path, version, dist_type, logs):
+            code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
 
     return code, out, err
 
@@ -1289,6 +1339,8 @@ async def _gradle_build_with_retry(build_dir, gcmd, logs, project_dir=None):
     Pass 1: Build terus.
     Pass 2: Detect NDK conflict → fix → retry.
     Pass 3: Detect AGP conflict → fix → retry.
+    Pass 4: Detect Gradle distribution gagal dimuat turun (mirror projek down/404)
+            → tukar ke services.gradle.org → retry.
     project_dir: root projek (untuk fix AGP dalam android/ subdir), default = build_dir
     """
     root = project_dir or build_dir
@@ -1317,6 +1369,18 @@ async def _gradle_build_with_retry(build_dir, gcmd, logs, project_dir=None):
         logs.append(f"Auto-fix: AGP conflict — dependency perlukan AGP >= {agp_required}")
         await fix_common_issues(root, logs)  # re-run fix dengan AGP baru
         code, out, err = await run_cmd(f"{gcmd} assembleDebug --stacktrace", cwd=build_dir)
+        if code == 0:
+            return code, out, err
+        combined = (err or "") + (out or "")
+
+    # Retry 3: Gradle distribution gagal dimuat turun (mirror projek rosak)
+    gradle_dist_fail = _parse_gradle_dist_error(combined)
+    if gradle_dist_fail:
+        version, dist_type = gradle_dist_fail
+        android_candidate = build_dir if os.path.exists(os.path.join(build_dir, "app")) else root
+        props_path = os.path.join(android_candidate, "gradle", "wrapper", "gradle-wrapper.properties")
+        if _force_official_gradle_url(props_path, version, dist_type, logs):
+            code, out, err = await run_cmd(f"{gcmd} assembleDebug --stacktrace", cwd=build_dir)
 
     return code, out, err
 

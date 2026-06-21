@@ -195,7 +195,12 @@ def detect_project_type(project_dir, hint=""):
 
 
 def package_result(project_dir, result, target_file):
-    hasil_zip = target_file if result.get("success") else f"{os.path.splitext(target_file)[0]}_error.zip"
+    if result.get("success"):
+        # Kalau target_file ialah .txt (laluan fail besar), hasil mesti .zip — bukan .txt
+        base_name, ext = os.path.splitext(target_file)
+        hasil_zip = f"{base_name}.zip" if ext.lower() == ".txt" else target_file
+    else:
+        hasil_zip = f"{os.path.splitext(target_file)[0]}_error.zip"
 
     with zipfile.ZipFile(hasil_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         if result.get("success"):
@@ -318,7 +323,7 @@ async def main():
         # FORMAT USER
         user_caption = "<blockquote>" + (
             "<b>Build Successful!</b>\n\n"
-            f"Project: {target_file}\n"
+            f"Project: {hasil_zip}\n"
             f"Type: {final_type.upper()}\n\n"
             "⚠️ Release APK/AAB is unsigned.\n\n"
             "BUILD BY @Earlxz"
