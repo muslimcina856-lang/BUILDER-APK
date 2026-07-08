@@ -1444,10 +1444,23 @@ async def build_flutter(project_dir, config):
         return {"success": False, "error": "Flutter SDK install failed", "logs": logs}
     logs.append(f"Flutter {flutter_version} ready")
 
+    # ── Step 0: scaffold folder android/ kalau tiada / tak lengkap ─────────────
+    # Sesetengah projek (source-only zip) sengaja tak sertakan folder android/,
+    # ios/ dsb (generated locally by convention). Kalau terus biar fix_common_issues
+    # jalan atas folder android/ yang tiada/tak lengkap, ia cuma patch sebahagian
+    # fail (gradle-wrapper.properties, local.properties) tanpa MainActivity/
+    # AndroidManifest/build.gradle yang betul — punca error "deleted v1 embedding".
+    android_dir = os.path.join(project_dir, "android")
+    manifest_path = os.path.join(android_dir, "app", "src", "main", "AndroidManifest.xml")
+    if not os.path.isdir(android_dir) or not os.path.exists(manifest_path):
+        logs.append("Auto-fix: folder android/ tiada atau tak lengkap, generate guna 'flutter create .'")
+        code0, out0, err0 = await run_cmd("flutter create .", cwd=project_dir, timeout=180)
+        if code0 != 0:
+            return {"success": False, "error": f"flutter create . gagal\n{err0}\n{out0}", "logs": logs}
+
     await fix_common_issues(project_dir, logs, "android")
 
     old_style = config.get("old_flutter_style", False)
-    android_dir = os.path.join(project_dir, "android")
 
     if not old_style:
         await fix_flutter_versions(project_dir, logs)
