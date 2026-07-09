@@ -866,6 +866,219 @@ def _force_official_gradle_url(props_path, version, dist_type, logs):
 
 
 # ================================================================
+# KOTLIN/JAVA JVM-TARGET MISMATCH (plugin pihak ketiga belum migrate ke
+# Flutter Built-in Kotlin — cth package_info_plus, share_plus, dll yang
+# masih apply Kotlin Gradle Plugin sendiri secara berasingan)
+# ================================================================
+
+def _parse_jvm_kotlin_mismatch(error_text):
+    """
+    Detect ralat 'Inconsistent JVM Target Compatibility' antara task Java
+    (cth compileDebugJavaWithJavac) dan task Kotlin (compileDebugKotlin).
+    Pulangkan (java_ver, kotlin_ver) sebagai int, atau None kalau tak jumpa.
+    """
+    m = re.search(
+        r"compileDebugJavaWithJavac['\x27]?\s*\((\d+)\)\s*and\s*['\x27]?compileDebugKotlin['\x27]?\s*\((\d+)\)",
+        error_text
+    )
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _has_kgp_plugin_warning(error_text):
+    """Detect amaran 'plugins that apply Kotlin Gradle Plugin (KGP)' dari Flutter."""
+    return "apply Kotlin Gradle Plugin (KGP)" in error_text
+
+
+def _set_kotlin_jvm_validation_warning(android_dir, logs):
+    """
+    Set kotlin.jvm.target.validation.mode=warning dalam gradle.properties.
+
+    Ini TIDAK menukar/paksa sebarang versi AGP/Kotlin/Java projek — cuma
+    minta Gradle papar amaran (bukan fail build) bila ia jumpa task Java &
+    Kotlin guna JVM-target berbeza across module (lazim berlaku bila plugin
+    pihak ketiga macam package_info_plus/share_plus dsb apply Kotlin Gradle
+    Plugin dia sendiri secara berasingan dari app, dan belum migrate ke
+    Flutter Built-in Kotlin). Idempotent — skip kalau dah pernah di-set.
+    """
+    props_path = os.path.join(android_dir, "gradle.properties")
+    try:
+        content = ""
+        if os.path.exists(props_path):
+            with open(props_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        if "kotlin.jvm.target.validation.mode" in content:
+            return False
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += "kotlin.jvm.target.validation.mode=warning\n"
+        with open(props_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        logs.append(
+            "Auto-fix: kotlin.jvm.target.validation.mode=warning "
+            "(plugin pihak ketiga guna JVM-target berbeza dari app — bukan konflik binari sebenar)"
+        )
+        return True
+    except Exception:
+        return False
+
+
+# Fallback generasi AGP terdahulu yang diketahui masih serasi dengan plugin
+# lama yang apply Kotlin Gradle Plugin secara manual (sebelum "Built-in
+# Kotlin" AGP 9 jadi wajib). Hanya digunakan sebagai LANGKAH TERAKHIR kalau
+# kotlin.jvm.target.validation.mode=warning masih tak cukup untuk build lulus.
+_AGP_MAJOR_FALLBACK = {
+    9: "8.7.0",
+    8: "7.4.2",
+    7: "4.2.2",
+}
+
+
+def _detect_agp_version(android_dir, project_dir):
+    """Detect versi AGP semasa projek (settings.gradle/.kts, build.gradle/.kts, libs.versions.toml)."""
+    for sg_name in ("settings.gradle.kts", "settings.gradle"):
+        sg_path = os.path.join(android_dir, sg_name)
+        if os.path.exists(sg_path):
+            try:
+                with open(sg_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                m = re.search(
+                    r'id\s*\(?\s*["\x27]com\.android\.(?:application|library)["\x27]\s*\)?\s+version\s+["\x27]([0-9.]+)["\x27]',
+                    content
+                )
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    for bg_name in ("build.gradle.kts", "build.gradle"):
+        bg_path = os.path.join(android_dir, bg_name)
+        if os.path.exists(bg_path):
+            try:
+                with open(bg_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                m = re.search(r'com\.android\.tools\.build:gradle:([0-9.]+)', content)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    for toml_path in (os.path.join(project_dir, "gradle", "libs.versions.toml"),
+                       os.path.join(android_dir, "gradle", "libs.versions.toml")):
+        if os.path.exists(toml_path):
+            try:
+                with open(toml_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                m = re.search(r'(?im)^\s*agp\s*=\s*["\x27]([0-9.]+)["\x27]', content)
+                if m:
+                    return m.group(1)
+            except Exception:
+                pass
+    return None
+
+
+def _set_agp_version(project_dir, android_dir, new_agp, logs, reason=""):
+    """
+    Tulis semula versi AGP guna cara declare yang SAMA seperti projek asal
+    (settings.gradle(.kts) / build.gradle(.kts) / libs.versions.toml) —
+    cuma nilai versi yang ditukar, bukan cara declare dia.
+    """
+    patterns = [
+        (os.path.join(android_dir, "settings.gradle.kts"),
+         r'(id\s*\(?\s*["\x27]com\.android\.(?:application|library)["\x27]\s*\)?\s+version\s+["\x27])([0-9.]+)(["\x27])'),
+        (os.path.join(android_dir, "settings.gradle"),
+         r'(id\s*\(?\s*["\x27]com\.android\.(?:application|library)["\x27]\s*\)?\s+version\s+["\x27])([0-9.]+)(["\x27])'),
+        (os.path.join(android_dir, "build.gradle.kts"),
+         r'(com\.android\.tools\.build:gradle:)([0-9.]+)()'),
+        (os.path.join(android_dir, "build.gradle"),
+         r'(com\.android\.tools\.build:gradle:)([0-9.]+)()'),
+    ]
+    for path, pattern in patterns:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            m = re.search(pattern, content)
+            if not m:
+                continue
+            new_content = content[:m.start()] + m.group(1) + new_agp + m.group(3) + content[m.end():]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+            suffix = f" — {reason}" if reason else ""
+            logs.append(f"Auto-fix: AGP → {new_agp} dalam {os.path.basename(path)}{suffix}")
+            return True
+        except Exception:
+            pass
+    for toml_path in (os.path.join(project_dir, "gradle", "libs.versions.toml"),
+                       os.path.join(android_dir, "gradle", "libs.versions.toml")):
+        if not os.path.exists(toml_path):
+            continue
+        try:
+            with open(toml_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            new_content, n = re.subn(
+                r'(?im)(^\s*agp\s*=\s*["\x27])([0-9.]+)(["\x27])',
+                lambda m: m.group(1) + new_agp + m.group(3),
+                content
+            )
+            if n:
+                with open(toml_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                suffix = f" — {reason}" if reason else ""
+                logs.append(f"Auto-fix: AGP → {new_agp} dalam libs.versions.toml{suffix}")
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, logs):
+    """
+    LANGKAH TERAKHIR: kalau kotlin.jvm.target.validation.mode=warning tak
+    cukup (masih gagal — bermakna konflik binari sebenar, bukan sekadar
+    validation check), turunkan AGP ke generasi SEBELUMNYA yang serasi
+    dengan plugin lama. Adaptif ikut AGP yang DIKESAN dalam projek — bukan
+    versi tetap yang dipaksa untuk semua projek.
+    """
+    cur_agp = _detect_agp_version(android_dir, project_dir)
+    if not cur_agp:
+        return False
+    try:
+        major = int(cur_agp.split(".")[0])
+    except (ValueError, IndexError):
+        return False
+    fallback_agp = _AGP_MAJOR_FALLBACK.get(major)
+    if not fallback_agp:
+        return False
+
+    ok = _set_agp_version(
+        project_dir, android_dir, fallback_agp, logs,
+        reason=f"plugin pihak ketiga belum serasi dgn AGP {major}.x Built-in Kotlin"
+    )
+    if not ok:
+        return False
+
+    required_gradle = _agp_to_min_gradle(fallback_agp)
+    props_path = os.path.join(android_dir, "gradle", "wrapper", "gradle-wrapper.properties")
+    if os.path.exists(props_path):
+        try:
+            with open(props_path, "r", encoding="utf-8", errors="replace") as f:
+                pc = f.read()
+            new_url = f"https\\://services.gradle.org/distributions/gradle-{required_gradle}-bin.zip"
+            new_pc = re.sub(r"distributionUrl=.*", f"distributionUrl={new_url}", pc)
+            with open(props_path, "w", encoding="utf-8") as f:
+                f.write(new_pc)
+            logs.append(f"Auto-fix: Gradle → {required_gradle} (selaras dengan AGP {fallback_agp})")
+        except Exception:
+            pass
+
+    required_java = _agp_to_min_java(fallback_agp)
+    await setup_java(str(required_java))
+    logs.append(f"Info: Java {required_java} diperlukan selepas AGP diturunkan ke {fallback_agp}")
+    return True
+
+
+# ================================================================
 # MAIN FIX FUNCTIONS
 # ================================================================
 
@@ -1321,6 +1534,32 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
         if code == 0:
             return code, out, err
         combined = (err or "") + (out or "")
+
+    # ── Retry 2.5: Kotlin/Java JVM-target conflict (plugin pihak ketiga cth
+    # package_info_plus/share_plus belum migrate ke Flutter Built-in Kotlin) ───
+    jvm_mismatch = _parse_jvm_kotlin_mismatch(combined)
+    kgp_warning = _has_kgp_plugin_warning(combined)
+    if jvm_mismatch or kgp_warning:
+        # Percubaan 1 (paling ringan, tak paksa/tukar versi apa-apa):
+        # benarkan Gradle papar amaran je untuk perbezaan JVM-target ni.
+        if _set_kotlin_jvm_validation_warning(android_dir, logs):
+            code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
+            if code == 0:
+                return code, out, err
+            combined = (err or "") + (out or "")
+
+        # Percubaan 2 (kalau masih gagal — bermakna konflik binari sebenar,
+        # bukan sekadar validation check): turunkan AGP ke generasi
+        # sebelumnya yang adaptif ikut AGP projek yang dikesan.
+        jvm_mismatch = _parse_jvm_kotlin_mismatch(combined)
+        kgp_warning = _has_kgp_plugin_warning(combined)
+        if jvm_mismatch or kgp_warning:
+            if await _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, logs):
+                await run_cmd("flutter pub get", cwd=project_dir, timeout=300)
+                code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
+                if code == 0:
+                    return code, out, err
+                combined = (err or "") + (out or "")
 
     # ── Retry 3: Gradle distribution gagal dimuat turun (mirror projek rosak) ──
     gradle_dist_fail = _parse_gradle_dist_error(combined)
