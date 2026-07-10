@@ -1691,7 +1691,17 @@ async def build_flutter(project_dir, config):
     # AndroidManifest/build.gradle yang betul — punca error "deleted v1 embedding".
     android_dir = os.path.join(project_dir, "android")
     manifest_path = os.path.join(android_dir, "app", "src", "main", "AndroidManifest.xml")
-    if not os.path.isdir(android_dir) or not os.path.exists(manifest_path):
+    build_gradle_path = os.path.join(android_dir, "app", "build.gradle")
+    build_gradle_kts_path = os.path.join(android_dir, "app", "build.gradle.kts")
+    settings_gradle_path = os.path.join(android_dir, "settings.gradle")
+    settings_gradle_kts_path = os.path.join(android_dir, "settings.gradle.kts")
+    android_incomplete = (
+        not os.path.isdir(android_dir)
+        or not os.path.exists(manifest_path)
+        or not (os.path.exists(build_gradle_path) or os.path.exists(build_gradle_kts_path))
+        or not (os.path.exists(settings_gradle_path) or os.path.exists(settings_gradle_kts_path))
+    )
+    if android_incomplete:
         logs.append("Auto-fix: folder android/ tiada atau tak lengkap, generate guna 'flutter create .'")
         code0, out0, err0 = await run_cmd("flutter create .", cwd=project_dir, timeout=180)
         if code0 != 0:
