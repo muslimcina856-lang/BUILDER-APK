@@ -1079,22 +1079,15 @@ async def _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, l
 
 
 # ================================================================
-# RELEASE SIGNING FIX (key.properties tiada)
+# RELEASE SIGNING — SENTIASA PAKSA UNSIGNED (debug signing)
 # ================================================================
 
-def _fix_release_signing_for_ci(android_dir, logs):
+def _force_unsigned_release(android_dir, logs):
     """
-    Jika projek guna signingConfigs.release tapi key.properties tiada,
-    tukar kepada signingConfigs.debug supaya release build boleh jalan
-    (hasil: unsigned APK/AAB).
-
-    Fungsi ini TIDAK ubah apa-apa kalau key.properties wujud —
-    projek yang sertakan keystore sendiri tetap guna signing asal.
+    Paksa SEMUA release build guna debug signing, tak kira key.properties
+    wujud atau tidak. Tujuan: hasil release APK/AAB sentiasa unsigned
+    (guna debug keystore), tak pernah cuba guna keystore projek asal.
     """
-    key_props = os.path.join(android_dir, "key.properties")
-    if os.path.exists(key_props):
-        return  # key.properties ada, tak perlu fix
-
     for bg_name in ("app/build.gradle", "app/build.gradle.kts"):
         bg_path = os.path.join(android_dir, bg_name)
         if not os.path.exists(bg_path):
@@ -1106,7 +1099,6 @@ def _fix_release_signing_for_ci(android_dir, logs):
             if "signingConfigs.release" not in content:
                 continue
 
-            # Tukar signingConfig release → debug dalam buildTypes
             new_content = re.sub(
                 r'signingConfig\s+signingConfigs\.release',
                 'signingConfig signingConfigs.debug',
@@ -1117,8 +1109,8 @@ def _fix_release_signing_for_ci(android_dir, logs):
                 with open(bg_path, "w", encoding="utf-8") as f:
                     f.write(new_content)
                 logs.append(
-                    "Auto-fix: key.properties tiada \u2192 release signing "
-                    "ditukar ke debug (hasil: unsigned APK/AAB)"
+                    "Auto-fix: release signing dipaksa guna debug "
+                    "(hasil: unsigned APK/AAB, key.properties diabaikan)"
                 )
         except Exception:
             pass
@@ -1701,6 +1693,8 @@ async def build_native(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Debug build failed\n{err}\n{out}", "logs": logs}
 
+    _force_unsigned_release(project_dir, logs)
+
     code2, out2, err2 = await run_cmd(f"{gcmd} assembleRelease --stacktrace", cwd=project_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
     code3, out3, err3 = await run_cmd(f"{gcmd} bundleRelease --stacktrace", cwd=project_dir)
@@ -1780,9 +1774,8 @@ async def build_flutter(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Debug build failed\n{err}\n{out}", "logs": logs}
 
-    # Auto-fix: kalau key.properties tiada, tukar signing ke debug
-    # supaya release APK dan AAB tetap boleh dibuild (unsigned)
-    _fix_release_signing_for_ci(android_dir, logs)
+    # Paksa release signing guna debug — abaikan key.properties sepenuhnya
+    _force_unsigned_release(android_dir, logs)
 
     code2, out2, err2 = await run_cmd("flutter build apk --release", cwd=project_dir)
     logs.append(f"apk release: {'OK' if code2 == 0 else 'FAIL'}")
@@ -2016,6 +2009,7 @@ async def build_react_native(project_dir, config):
     logs.append(f"assembleDebug: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"Debug build gagal\n{err}\n{out}", "logs": logs}
+    _force_unsigned_release(android_dir, logs)
     code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
     code3, out3, err3 = await run_cmd("./gradlew bundleRelease --stacktrace", cwd=android_dir)
@@ -2108,6 +2102,7 @@ async def build_ionic(project_dir, config):
             logs.append(f"assembleDebug: {'OK' if code == 0 else 'FAIL'}")
             if code != 0:
                 return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
+            _force_unsigned_release(android_dir, logs)
             code2, _, _ = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
             logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
             code3, _, _ = await run_cmd("./gradlew bundleRelease --stacktrace", cwd=android_dir)
@@ -2168,6 +2163,7 @@ async def build_capacitor(project_dir, config):
     logs.append(f"assembleDebug: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
+    _force_unsigned_release(android_dir, logs)
     code2, _, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
     code3, _, err3 = await run_cmd("./gradlew bundleRelease --stacktrace", cwd=android_dir)
