@@ -1079,6 +1079,52 @@ async def _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, l
 
 
 # ================================================================
+# RELEASE SIGNING FIX (key.properties tiada)
+# ================================================================
+
+def _fix_release_signing_for_ci(android_dir, logs):
+    """
+    Jika projek guna signingConfigs.release tapi key.properties tiada,
+    tukar kepada signingConfigs.debug supaya release build boleh jalan
+    (hasil: unsigned APK/AAB).
+
+    Fungsi ini TIDAK ubah apa-apa kalau key.properties wujud —
+    projek yang sertakan keystore sendiri tetap guna signing asal.
+    """
+    key_props = os.path.join(android_dir, "key.properties")
+    if os.path.exists(key_props):
+        return  # key.properties ada, tak perlu fix
+
+    for bg_name in ("app/build.gradle", "app/build.gradle.kts"):
+        bg_path = os.path.join(android_dir, bg_name)
+        if not os.path.exists(bg_path):
+            continue
+        try:
+            with open(bg_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            if "signingConfigs.release" not in content:
+                continue
+
+            # Tukar signingConfig release → debug dalam buildTypes
+            new_content = re.sub(
+                r'signingConfig\s+signingConfigs\.release',
+                'signingConfig signingConfigs.debug',
+                content
+            )
+
+            if new_content != content:
+                with open(bg_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                logs.append(
+                    "Auto-fix: key.properties tiada \u2192 release signing "
+                    "ditukar ke debug (hasil: unsigned APK/AAB)"
+                )
+        except Exception:
+            pass
+
+
+# ================================================================
 # MAIN FIX FUNCTIONS
 # ================================================================
 
@@ -1733,6 +1779,10 @@ async def build_flutter(project_dir, config):
     logs.append(f"apk debug: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"Debug build failed\n{err}\n{out}", "logs": logs}
+
+    # Auto-fix: kalau key.properties tiada, tukar signing ke debug
+    # supaya release APK dan AAB tetap boleh dibuild (unsigned)
+    _fix_release_signing_for_ci(android_dir, logs)
 
     code2, out2, err2 = await run_cmd("flutter build apk --release", cwd=project_dir)
     logs.append(f"apk release: {'OK' if code2 == 0 else 'FAIL'}")
