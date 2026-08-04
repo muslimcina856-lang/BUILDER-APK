@@ -10,7 +10,7 @@ import sys
 import tempfile
 import urllib.request
 import zipfile
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import aiohttp
 
@@ -1160,15 +1160,38 @@ def find_project_directory(build_dir):
 
 async def download_project_link(download_url, destination):
     timeout = aiohttp.ClientTimeout(total=600)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.get(download_url, allow_redirects=True) as response:
-            if response.status != 200:
-                raise RuntimeError(f"Download gagal: HTTP {response.status}")
-            with open(destination, "wb") as f:
-                async for chunk in response.content.iter_chunked(1024 * 1024):
-                    f.write(chunk)
-    if not os.path.exists(destination) or os.path.getsize(destination) == 0:
-        raise RuntimeError("Fail pautan kosong atau tidak dapat dimuat turun")
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        )
+    }
+    host = (urlparse(download_url).hostname or "").lower()
+    methods = ("POST",) if host == "temp.sh" else ("GET", "POST")
+    last_error = None
+
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        for method in methods:
+            try:
+                async with session.request(method, download_url, allow_redirects=True) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"Download gagal: HTTP {response.status}")
+                    with open(destination, "wb") as f:
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            f.write(chunk)
+                if os.path.exists(destination) and os.path.getsize(destination) > 0:
+                    return
+                raise RuntimeError("Fail pautan kosong atau tidak dapat dimuat turun")
+            except Exception as error:
+                last_error = error
+                try:
+                    if os.path.exists(destination):
+                        os.remove(destination)
+                except OSError:
+                    pass
+
+    raise last_error or RuntimeError("Fail pautan kosong atau tidak dapat dimuat turun")
 
 
 async def send_failure(bot_token, chat_id, user_display, project_type, result, project_dir, target_file):
