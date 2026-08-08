@@ -715,27 +715,98 @@ async def _debug_sign_apks(apks_path, keystore, logs):
             os.remove(temporary)
 
 
-async def ensure_debug_signed_outputs(result):
+def _is_release_apk(output_path):
+    normalized = output_path.replace("\\", "/").lower()
+    filename = os.path.basename(normalized)
+    return (
+        "/release/" in normalized
+        or "-release" in filename
+        or "_release" in filename
+        or "release-unsigned" in filename
+        or "release-unsigned" in normalized
+    )
+
+
+def _has_archive_signature_entries(archive_path):
+    signature_suffixes = (".SF", ".RSA", ".DSA", ".EC")
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        for name in archive.namelist():
+            upper = name.upper()
+            if upper.startswith("META-INF/") and upper.endswith(signature_suffixes):
+                return True
+    return False
+
+
+async def _make_unsigned_release_apk(apk_path, logs):
+    _strip_archive_signatures(apk_path)
+    zipalign = _find_android_build_tool("zipalign")
+    if zipalign:
+        aligned_path = apk_path + ".aligned"
+        try:
+            command = (
+                f"{shlex.quote(zipalign)} -p -f 4 "
+                f"{shlex.quote(apk_path)} {shlex.quote(aligned_path)}"
+            )
+            code, output, error = await run_cmd(command, timeout=120)
+            if code != 0 or not os.path.exists(aligned_path):
+                raise RuntimeError(f"zipalign release APK gagal: {(error or output)[-1000:]}")
+            os.replace(aligned_path, apk_path)
+        finally:
+            if os.path.exists(aligned_path):
+                os.remove(aligned_path)
+    logs.append(f"Unsigned release APK ready: {os.path.basename(apk_path)}")
+
+
+async def prepare_outputs_for_delivery(result):
     files = result.get("files", [])
     logs = result.setdefault("logs", [])
     if not files:
-        raise RuntimeError("Build berjaya tetapi tiada output untuk debug signing")
+        raise RuntimeError("Build berjaya tetapi tiada output untuk dihantar")
 
-    await _ensure_debug_signing_tools(logs)
-    keystore = await _ensure_debug_keystore(logs)
+    keystore = None
+    debug_signed = False
+    unsigned_release = False
+    debug_files = {os.path.abspath(path) for path in result.get("debug_files", [])}
+
+    async def get_debug_keystore():
+        nonlocal keystore
+        if keystore is None:
+            await _ensure_debug_signing_tools(logs)
+            keystore = await _ensure_debug_keystore(logs)
+        return keystore
+
     for output_path in files:
         if not os.path.exists(output_path):
             raise RuntimeError(f"Output build tidak ditemui: {output_path}")
         extension = os.path.splitext(output_path)[1].lower()
-        if extension == ".apk":
-            await _debug_sign_apk(output_path, keystore, logs)
-        elif extension == ".aab":
-            await _debug_sign_aab(output_path, keystore, logs)
+
+        if extension == ".aab":
+            _strip_archive_signatures(output_path)
+            if _has_archive_signature_entries(output_path):
+                raise RuntimeError(f"AAB masih mempunyai signature selepas proses unsigned: {output_path}")
+            logs.append(f"Unsigned AAB ready for release signing: {os.path.basename(output_path)}")
+            unsigned_release = True
+        elif extension == ".apk" and os.path.abspath(output_path) in debug_files:
+            await _debug_sign_apk(output_path, await get_debug_keystore(), logs)
+            debug_signed = True
+        elif (
+            extension == ".apk"
+            and "release_failures" in result
+            and _is_release_apk(output_path)
+        ):
+            await _make_unsigned_release_apk(output_path, logs)
+            unsigned_release = True
+        elif extension == ".apk":
+            await _debug_sign_apk(output_path, await get_debug_keystore(), logs)
+            debug_signed = True
         elif extension == ".apks":
-            await _debug_sign_apks(output_path, keystore, logs)
+            await _debug_sign_apks(output_path, await get_debug_keystore(), logs)
+            debug_signed = True
         else:
-            raise RuntimeError(f"Format output tidak disokong untuk debug signing: {output_path}")
-    result["debug_signed"] = True
+            raise RuntimeError(f"Format output tidak disokong: {output_path}")
+
+    result["debug_signed"] = debug_signed
+    result["unsigned_release"] = unsigned_release
     return result
 
 
@@ -1113,6 +1184,17 @@ def package_result(project_dir, result, target_file):
             for filepath in result.get("files", []):
                 if os.path.exists(filepath):
                     archive.write(filepath, os.path.basename(filepath))
+            release_failures = result.get("release_failures") or []
+            if release_failures:
+                release_log = (
+                    "=== RELEASE BUILD PARTIAL FAILURE ===\n\n"
+                    "Debug output berjaya dan disertakan dalam ZIP ini.\n"
+                    "Release output yang gagal tidak dianggap sebagai kegagalan keseluruhan build.\n\n"
+                    + "\n\n".join(release_failures)
+                    + "\n\n=== BUILD STEPS ===\n\n"
+                    + "\n".join(result.get("logs", []))
+                )
+                archive.writestr("RELEASE_BUILD_ERROR.txt", release_log)
         else:
             os.makedirs(project_dir, exist_ok=True)
             error_log = os.path.join(project_dir, "build_error.log")
@@ -1346,7 +1428,7 @@ async def main():
             else:
                 result = await build_project(project_dir, {"type": final_type, "config": config})
             if result.get("success"):
-                result = await ensure_debug_signed_outputs(result)
+                result = await prepare_outputs_for_delivery(result)
     except Exception as error:
         logger.exception("Unhandled build worker error")
         result = {
@@ -1389,11 +1471,26 @@ async def main():
                 target_file,
             )
         else:
+            release_failures = result.get("release_failures") or []
+            if release_failures:
+                output_note = (
+                    "⚠️ Release build tidak lengkap/gagal. Debug APK yang berjaya tetap disertakan dengan debug signing.\n"
+                    "Semak RELEASE_BUILD_ERROR.txt dalam ZIP untuk log release.\n"
+                    "Jika ada AAB/release output, ia UNSIGNED dan perlu disign sekali dengan keystore sendiri."
+                )
+            elif result.get("unsigned_release"):
+                output_note = (
+                    "✅ AAB/release output adalah UNSIGNED. "
+                    "Sign sekali sahaja dengan upload/release keystore sendiri sebelum publish."
+                )
+            else:
+                output_note = "ℹ️ Debug output menggunakan debug signing untuk pemasangan/testing."
+
             user_caption = "<blockquote>" + (
                 "<b>Build Successful!</b>\n\n"
                 f"Project: {output_zip}\n"
                 f"Type: {final_type.upper()}\n\n"
-                "⚠️ Output menggunakan debug signing. Sign semula dengan keystore sendiri untuk release.\n\n"
+                f"{output_note}\n\n"
                 "BUILD BY @Earlxz"
             ) + "</blockquote>"
             channel_caption = "<blockquote>" + (
