@@ -1094,6 +1094,72 @@ async def _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, l
 
 
 # ================================================================
+# RELEASE SIGNING - PAKSA RELEASE GRADLE MENJADI UNSIGNED
+# ================================================================
+
+def _neutralize_release_signing_block(content, kotlin_dsl=False):
+    """Neutralize signingConfig hanya dalam build type release; debug tidak disentuh."""
+    lines = content.splitlines(keepends=True)
+    release_start = re.compile(
+        r'^\s*(?:release|getByName\(\s*["\']release["\']\s*\)|named\(\s*["\']release["\']\s*\))\s*\{'
+    )
+    changed = False
+    in_release = False
+    depth = 0
+
+    for index, line in enumerate(lines):
+        if not in_release and release_start.search(line):
+            in_release = True
+            depth = line.count("{") - line.count("}")
+        elif in_release:
+            depth += line.count("{") - line.count("}")
+
+        if in_release and re.match(r'^\s*signingConfig\b', line):
+            indent = re.match(r'^\s*', line).group(0)
+            newline = "\n" if line.endswith("\n") else ""
+            replacement = f"{indent}signingConfig = null{newline}"
+            if replacement != line:
+                lines[index] = replacement
+                changed = True
+
+        if in_release and depth <= 0:
+            in_release = False
+            depth = 0
+
+    return "".join(lines), changed
+
+
+def _force_unsigned_release(android_dir, logs):
+    """
+    Paksa release Gradle menjadi unsigned dengan mematikan signingConfig
+    dalam build type release. Tidak strip/re-sign output dan tidak sentuh debug.
+    """
+    changed_any = False
+    for bg_name in ("app/build.gradle", "app/build.gradle.kts"):
+        bg_path = os.path.join(android_dir, bg_name)
+        if not os.path.exists(bg_path):
+            continue
+        try:
+            with open(bg_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+
+            new_content, changed = _neutralize_release_signing_block(
+                content, kotlin_dsl=bg_name.endswith(".kts")
+            )
+            if changed:
+                with open(bg_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+                changed_any = True
+                logs.append(
+                    "Auto-fix: signingConfig release dinyahaktifkan "
+                    "(release output unsigned; debug tidak disentuh)"
+                )
+        except Exception as exc:
+            logs.append(f"Warning: gagal neutralize release signing: {exc}")
+    return changed_any
+
+
+# ================================================================
 # MAIN FIX FUNCTIONS
 # ================================================================
 
@@ -1671,6 +1737,7 @@ async def build_native(project_dir, config):
         return {"success": False, "error": f"Debug build failed\n{err}\n{out}", "logs": logs}
 
     output_dirs = [os.path.join(project_dir, "app", "build", "outputs")]
+    _force_unsigned_release(project_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd(f"{gcmd} assembleRelease --stacktrace", cwd=project_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
@@ -1751,6 +1818,7 @@ async def build_flutter(project_dir, config):
         os.path.join(project_dir, "build", "app", "outputs"),
         os.path.join(project_dir, "build", "outputs"),
     ]
+    _force_unsigned_release(android_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("flutter build apk --release", cwd=project_dir)
     logs.append(f"apk release: {'OK' if code2 == 0 else 'FAIL'}")
@@ -1978,6 +2046,7 @@ async def build_react_native(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Debug build gagal\n{err}\n{out}", "logs": logs}
     output_dirs = [os.path.join(android_dir, "app", "build", "outputs")]
+    _force_unsigned_release(android_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
@@ -2022,6 +2091,7 @@ async def build_cordova(project_dir, config):
         os.path.join(project_dir, "platforms", "android", "app", "build", "outputs"),
         os.path.join(project_dir, "platforms", "android", "build", "outputs"),
     ]
+    _force_unsigned_release(android_platform, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("cordova build android --release", cwd=project_dir, timeout=900)
     logs.append(f"cordova build release: {'OK' if code2 == 0 else 'FAIL'}")
@@ -2078,6 +2148,7 @@ async def build_ionic(project_dir, config):
             logs.append(f"assembleDebug: {'OK' if code == 0 else 'FAIL'}")
             if code != 0:
                 return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
+            _force_unsigned_release(android_dir, logs)
             code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
             logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
             _record_release_failure(release_failures, "assembleRelease", code2, out2, err2)
@@ -2096,6 +2167,7 @@ async def build_ionic(project_dir, config):
                 return {"success": False, "error": f"Gagal tambah platform\n{err}\n{out}", "logs": logs}
         if os.path.isdir(android_platform):
             await fix_common_issues(android_platform, logs)
+        _force_unsigned_release(android_platform, logs)
         code, out, err = await run_cmd("ionic cordova build android --prod", cwd=project_dir, timeout=900)
         logs.append(f"ionic cordova build: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
@@ -2141,6 +2213,7 @@ async def build_capacitor(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
     output_dirs = [os.path.join(android_dir, "app", "build", "outputs")]
+    _force_unsigned_release(android_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
