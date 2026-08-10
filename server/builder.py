@@ -290,6 +290,19 @@ def _collect_apks(search_dirs):
                 for fn in fnames:
                     if fn.endswith((".apk", ".aab")):
                         files.append(os.path.join(root, fn))
+
+    # Jika Android Gradle menghasilkan kedua-dua nama untuk release unsigned,
+    # ambil app-release-unsigned.apk sahaja dan abaikan salinan app-release.apk.
+    has_app_release_unsigned = any(
+        os.path.basename(path).lower() == "app-release-unsigned.apk"
+        for path in files
+    )
+    if has_app_release_unsigned:
+        files = [
+            path for path in files
+            if os.path.basename(path).lower() != "app-release.apk"
+        ]
+
     return files
 
 
