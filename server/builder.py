@@ -4,7 +4,6 @@ import re
 import shutil
 import logging
 import zipfile
-import filecmp
 import aiohttp
 
 
@@ -293,76 +292,6 @@ def _collect_apks(search_dirs):
                         files.append(os.path.join(root, fn))
     return files
 
-
-def _looks_like_debug_apk(filepath):
-    normalized = filepath.replace("\\", "/").lower()
-    filename = os.path.basename(normalized)
-    return (
-        "/debug/" in normalized
-        or "-debug" in filename
-        or "_debug" in filename
-        or filename.startswith("debug-")
-    )
-
-
-def _snapshot_debug_apks(search_dirs, project_dir, logs):
-    """Simpan debug APK sebelum release supaya release gagal/clean tak memadam fallback."""
-    all_apks = [p for p in _collect_apks(search_dirs) if p.lower().endswith(".apk")]
-    candidates = [p for p in all_apks if _looks_like_debug_apk(p)]
-
-    if not candidates and all_apks:
-        try:
-            newest = max(os.path.getmtime(p) for p in all_apks)
-            candidates = [p for p in all_apks if newest - os.path.getmtime(p) <= 5]
-        except OSError:
-            candidates = []
-
-    if not candidates:
-        logs.append("Warning: debug build berjaya tetapi debug APK fallback tidak dapat disnapshot")
-        return []
-
-    unique_candidates = []
-    for source in candidates:
-        duplicate = False
-        for existing in unique_candidates:
-            try:
-                if filecmp.cmp(source, existing, shallow=False):
-                    duplicate = True
-                    break
-            except OSError:
-                pass
-        if duplicate:
-            logs.append(f"Duplicate debug APK skipped: {os.path.basename(source)}")
-            continue
-        unique_candidates.append(source)
-
-    fallback_dir = os.path.join(project_dir, ".builder_debug_fallback")
-    os.makedirs(fallback_dir, exist_ok=True)
-    snapshots = []
-    used_names = set()
-    for index, source in enumerate(unique_candidates, 1):
-        name = os.path.basename(source)
-        if name in used_names:
-            stem, ext = os.path.splitext(name)
-            name = f"{stem}-{index}{ext}"
-        used_names.add(name)
-        destination = os.path.join(fallback_dir, name)
-        shutil.copy2(source, destination)
-        snapshots.append(destination)
-
-    logs.append(f"Debug fallback preserved: {len(snapshots)} APK")
-    return snapshots
-
-
-def _collect_with_debug_fallback(search_dirs, debug_snapshots):
-    files = _collect_apks(search_dirs)
-    if debug_snapshots:
-        files = [
-            p for p in files
-            if not (p.lower().endswith(".apk") and _looks_like_debug_apk(p))
-        ]
-        files.extend(p for p in debug_snapshots if os.path.exists(p))
-    return list(dict.fromkeys(files))
 
 
 def _record_release_failure(release_failures, label, code, out, err):
@@ -1165,70 +1094,6 @@ async def _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, l
 
 
 # ================================================================
-# RELEASE SIGNING — SENTIASA PAKSA BETUL-BETUL UNSIGNED
-# ================================================================
-
-def _neutralize_release_signing_block(content, kotlin_dsl=False):
-    """Buang signingConfig hanya dalam buildType release tanpa sentuh debug."""
-    lines = content.splitlines(keepends=True)
-    release_start = re.compile(
-        r'^\s*(?:release|getByName\(\s*["\']release["\']\s*\)|named\(\s*["\']release["\']\s*\))\s*\{'
-    )
-    changed = False
-    in_release = False
-    depth = 0
-
-    for index, line in enumerate(lines):
-        if not in_release and release_start.search(line):
-            in_release = True
-            depth = line.count("{") - line.count("}")
-        elif in_release:
-            depth += line.count("{") - line.count("}")
-
-        if in_release and re.match(r'^\s*signingConfig\b', line):
-            indent = re.match(r'^\s*', line).group(0)
-            newline = "\n" if line.endswith("\n") else ""
-            replacement = f"{indent}signingConfig = null{newline}"
-            if replacement != line:
-                lines[index] = replacement
-                changed = True
-
-        if in_release and depth <= 0:
-            in_release = False
-            depth = 0
-
-    return "".join(lines), changed
-
-
-def _force_unsigned_release(android_dir, logs):
-    """
-    Pastikan release build tidak menggunakan release key atau debug key projek.
-    Output release akan diproses sekali lagi oleh worker supaya AAB/release APK
-    yang dihantar benar-benar unsigned.
-    """
-    for bg_name in ("app/build.gradle", "app/build.gradle.kts"):
-        bg_path = os.path.join(android_dir, bg_name)
-        if not os.path.exists(bg_path):
-            continue
-        try:
-            with open(bg_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-
-            new_content, changed = _neutralize_release_signing_block(
-                content, kotlin_dsl=bg_name.endswith(".kts")
-            )
-            if changed:
-                with open(bg_path, "w", encoding="utf-8") as f:
-                    f.write(new_content)
-                logs.append(
-                    "Auto-fix: signingConfig release dinyahaktifkan "
-                    "(release output wajib unsigned)"
-                )
-        except Exception:
-            pass
-
-
-# ================================================================
 # MAIN FIX FUNCTIONS
 # ================================================================
 
@@ -1806,9 +1671,6 @@ async def build_native(project_dir, config):
         return {"success": False, "error": f"Debug build failed\n{err}\n{out}", "logs": logs}
 
     output_dirs = [os.path.join(project_dir, "app", "build", "outputs")]
-    debug_snapshots = _snapshot_debug_apks(output_dirs, project_dir, logs)
-    _force_unsigned_release(project_dir, logs)
-
     release_failures = []
     code2, out2, err2 = await run_cmd(f"{gcmd} assembleRelease --stacktrace", cwd=project_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
@@ -1817,10 +1679,10 @@ async def build_native(project_dir, config):
     logs.append(f"bundleRelease: {'OK' if code3 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "bundleRelease", code3, out3, err3)
 
-    files = _collect_with_debug_fallback(output_dirs, debug_snapshots)
+    files = _collect_apks(output_dirs)
     if not files:
         return {"success": False, "error": f"No output files found.\n{err}\n{err2}\n{err3}", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 async def build_flutter(project_dir, config):
@@ -1889,11 +1751,6 @@ async def build_flutter(project_dir, config):
         os.path.join(project_dir, "build", "app", "outputs"),
         os.path.join(project_dir, "build", "outputs"),
     ]
-    debug_snapshots = _snapshot_debug_apks(output_dirs, project_dir, logs)
-
-    # Release mesti unsigned; debug APK kekal sebagai fallback jika release gagal.
-    _force_unsigned_release(android_dir, logs)
-
     release_failures = []
     code2, out2, err2 = await run_cmd("flutter build apk --release", cwd=project_dir)
     logs.append(f"apk release: {'OK' if code2 == 0 else 'FAIL'}")
@@ -1902,10 +1759,10 @@ async def build_flutter(project_dir, config):
     logs.append(f"appbundle: {'OK' if code3 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "flutter build appbundle --release", code3, out3, err3)
 
-    files = _collect_with_debug_fallback(output_dirs, debug_snapshots)
+    files = _collect_apks(output_dirs)
     if not files:
         return {"success": False, "error": f"No output files found.\n{err}\n{err2}\n{err3}", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 def _find_zipalign():
@@ -2121,8 +1978,6 @@ async def build_react_native(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Debug build gagal\n{err}\n{out}", "logs": logs}
     output_dirs = [os.path.join(android_dir, "app", "build", "outputs")]
-    debug_snapshots = _snapshot_debug_apks(output_dirs, project_dir, logs)
-    _force_unsigned_release(android_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
@@ -2130,10 +1985,10 @@ async def build_react_native(project_dir, config):
     code3, out3, err3 = await run_cmd("./gradlew bundleRelease --stacktrace", cwd=android_dir)
     logs.append(f"bundleRelease: {'OK' if code3 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "bundleRelease", code3, out3, err3)
-    files = _collect_with_debug_fallback(output_dirs, debug_snapshots)
+    files = _collect_apks(output_dirs)
     if not files:
         return {"success": False, "error": f"Tiada output APK/AAB\n{err}\n{err2}", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 async def build_cordova(project_dir, config):
@@ -2167,16 +2022,14 @@ async def build_cordova(project_dir, config):
         os.path.join(project_dir, "platforms", "android", "app", "build", "outputs"),
         os.path.join(project_dir, "platforms", "android", "build", "outputs"),
     ]
-    debug_snapshots = _snapshot_debug_apks(output_dirs, project_dir, logs)
-    _force_unsigned_release(android_platform, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("cordova build android --release", cwd=project_dir, timeout=900)
     logs.append(f"cordova build release: {'OK' if code2 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "cordova build android --release", code2, out2, err2)
-    files = _collect_with_debug_fallback(output_dirs, debug_snapshots)
+    files = _collect_apks(output_dirs)
     if not files:
         return {"success": False, "error": f"Tiada output APK\n{err}\n{err2}", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 async def build_ionic(project_dir, config):
@@ -2200,7 +2053,6 @@ async def build_ionic(project_dir, config):
     ])
 
     release_failures = []
-    debug_snapshots = []
 
     if is_capacitor:
         logs.append("Detected: Ionic + Capacitor")
@@ -2226,9 +2078,6 @@ async def build_ionic(project_dir, config):
             logs.append(f"assembleDebug: {'OK' if code == 0 else 'FAIL'}")
             if code != 0:
                 return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
-            search_dirs = [os.path.join(project_dir, "android", "app", "build", "outputs")]
-            debug_snapshots = _snapshot_debug_apks(search_dirs, project_dir, logs)
-            _force_unsigned_release(android_dir, logs)
             code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
             logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
             _record_release_failure(release_failures, "assembleRelease", code2, out2, err2)
@@ -2247,24 +2096,19 @@ async def build_ionic(project_dir, config):
                 return {"success": False, "error": f"Gagal tambah platform\n{err}\n{out}", "logs": logs}
         if os.path.isdir(android_platform):
             await fix_common_issues(android_platform, logs)
-        code, out, err = await run_cmd("ionic cordova build android --debug", cwd=project_dir, timeout=900)
-        logs.append(f"ionic cordova debug: {'OK' if code == 0 else 'FAIL'}")
+        code, out, err = await run_cmd("ionic cordova build android --prod", cwd=project_dir, timeout=900)
+        logs.append(f"ionic cordova build: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
-            return {"success": False, "error": f"Ionic Cordova debug build gagal\n{err}\n{out}", "logs": logs}
+            return {"success": False, "error": f"Ionic Cordova build gagal\n{err}\n{out}", "logs": logs}
         search_dirs = [
             os.path.join(project_dir, "platforms", "android", "app", "build", "outputs"),
             os.path.join(project_dir, "platforms", "android", "build", "outputs"),
         ]
-        debug_snapshots = _snapshot_debug_apks(search_dirs, project_dir, logs)
-        _force_unsigned_release(android_platform, logs)
-        code2, out2, err2 = await run_cmd("ionic cordova build android --prod --release", cwd=project_dir, timeout=900)
-        logs.append(f"ionic cordova release: {'OK' if code2 == 0 else 'FAIL'}")
-        _record_release_failure(release_failures, "ionic cordova build android --prod --release", code2, out2, err2)
 
-    files = _collect_with_debug_fallback(search_dirs, debug_snapshots)
+    files = _collect_apks(search_dirs)
     if not files:
         return {"success": False, "error": "Tiada output APK/AAB dijumpai", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 async def build_capacitor(project_dir, config):
@@ -2297,8 +2141,6 @@ async def build_capacitor(project_dir, config):
     if code != 0:
         return {"success": False, "error": f"Gradle build gagal\n{err}\n{out}", "logs": logs}
     output_dirs = [os.path.join(android_dir, "app", "build", "outputs")]
-    debug_snapshots = _snapshot_debug_apks(output_dirs, project_dir, logs)
-    _force_unsigned_release(android_dir, logs)
     release_failures = []
     code2, out2, err2 = await run_cmd("./gradlew assembleRelease --stacktrace", cwd=android_dir)
     logs.append(f"assembleRelease: {'OK' if code2 == 0 else 'FAIL'}")
@@ -2306,10 +2148,10 @@ async def build_capacitor(project_dir, config):
     code3, out3, err3 = await run_cmd("./gradlew bundleRelease --stacktrace", cwd=android_dir)
     logs.append(f"bundleRelease: {'OK' if code3 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "bundleRelease", code3, out3, err3)
-    files = _collect_with_debug_fallback(output_dirs, debug_snapshots)
+    files = _collect_apks(output_dirs)
     if not files:
         return {"success": False, "error": f"Tiada output APK/AAB\n{err}\n{err2}", "logs": logs}
-    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures, "debug_files": debug_snapshots}
+    return {"success": True, "files": files, "logs": logs, "release_failures": release_failures}
 
 
 async def build_project(project_dir, project_info):

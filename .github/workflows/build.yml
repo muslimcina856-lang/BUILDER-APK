@@ -14,9 +14,8 @@ on:
         description: 'Telegram Bot Token'
         required: true
       project_type:
-        description: 'Legacy project type input (ignored; worker auto-detects)'
-        required: false
-        default: ''
+        description: 'Project Type'
+        required: true
       user_display:
         description: 'User display name'
         required: true
@@ -58,6 +57,7 @@ jobs:
           BOT_TOKEN: ${{ github.event.inputs.bot_token }}
           CHAT_ID: ${{ github.event.inputs.chat_id }}
           CHANNEL_ID: ${{ github.event.inputs.channel_id }}
+          PROJECT_TYPE: ${{ github.event.inputs.project_type }}
           USER_DISPLAY: ${{ github.event.inputs.user_display }}
           IN_PROGRESS: ${{ github.event.inputs.in_progress }}
           TARGET_FILE: ${{ github.event.inputs.target }}

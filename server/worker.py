@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlparse
 
 import aiohttp
 
-from builder import build_project, run_cmd, setup_android_sdk, setup_java
+from builder import build_project, run_cmd, setup_java
 from upload_handler import upload_gofile, send_telegram_notification, send_telegram_document
 
 
@@ -356,33 +356,6 @@ architectures/x86_64=false
     return path
 
 
-async def _ensure_debug_keystore(logs):
-    keystore = os.path.expanduser("~/.android/debug.keystore")
-    if os.path.exists(keystore):
-        command = (
-            "keytool -list -keystore " + shlex.quote(keystore)
-            + " -storepass android -alias androiddebugkey"
-        )
-        code, _, _ = await run_cmd(command, timeout=60)
-        if code == 0:
-            logs.append("Android debug keystore ready")
-            return keystore
-        os.remove(keystore)
-
-    os.makedirs(os.path.dirname(keystore), exist_ok=True)
-    command = (
-        "keytool -genkeypair -v -keystore " + shlex.quote(keystore)
-        + " -storepass android -alias androiddebugkey -keypass android"
-        + " -keyalg RSA -keysize 2048 -validity 10000"
-        + " -dname " + shlex.quote("CN=Android Debug,O=Android,C=US")
-    )
-    code, output, error = await run_cmd(command, timeout=120)
-    if code != 0 or not os.path.exists(keystore):
-        raise RuntimeError(f"Gagal menjana debug keystore: {(error or output)[-1000:]}")
-    logs.append("Android debug keystore generated")
-    return keystore
-
-
 def _godot_android_profile(version):
     parsed = _version_tuple(version) or (4, 0, 0)
     major, minor, _ = parsed
@@ -533,284 +506,7 @@ async def _setup_godot_android_requirements(version, logs):
     return profile
 
 
-async def _ensure_debug_signing_tools(logs):
-    if not await setup_java("17"):
-        raise RuntimeError("Java 17 setup gagal untuk Android debug signing")
-    active_java = await _active_java_major()
-    if active_java < 17:
-        raise RuntimeError(
-            f"Android debug signing memerlukan Java 17 atau lebih baharu, Java {active_java} aktif"
-        )
-    logs.append(f"Java {active_java} ready for Android debug signing")
-
-    android_home = os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk")
-    required_dir = os.path.join(android_home, "build-tools", "35.0.1")
-    if not all(os.path.exists(os.path.join(required_dir, tool)) for tool in ("zipalign", "apksigner")):
-        sdkmanager = _find_sdkmanager()
-        if not sdkmanager:
-            raise RuntimeError("sdkmanager Android tidak ditemui untuk memasang signing tools")
-        command = (
-            f"yes | {shlex.quote(sdkmanager)} --sdk_root={shlex.quote(android_home)} "
-            + shlex.quote("build-tools;35.0.1")
-        )
-        code, output, error = await run_cmd(command, timeout=600)
-        if code != 0:
-            raise RuntimeError(
-                "Gagal memasang Android Build Tools 35.0.1: "
-                + (error or output or "unknown sdkmanager error")[-1000:]
-            )
-    if not all(os.path.exists(os.path.join(required_dir, tool)) for tool in ("zipalign", "apksigner")):
-        raise RuntimeError("zipalign atau apksigner Build Tools 35.0.1 tidak lengkap")
-    logs.append("Android Build Tools 35.0.1 ready for debug signing")
-
-
-def _find_android_build_tool(tool_name):
-    android_home = os.environ.get("ANDROID_HOME", "/usr/local/lib/android/sdk")
-    required = os.path.join(android_home, "build-tools", "35.0.1", tool_name)
-    if os.path.exists(required):
-        return required
-
-    build_tools_dir = os.path.join(android_home, "build-tools")
-    if not os.path.isdir(build_tools_dir):
-        return shutil.which(tool_name)
-    versions = sorted(
-        os.listdir(build_tools_dir),
-        key=lambda version: _version_tuple(version) or (0, 0, 0),
-        reverse=True,
-    )
-    for version in versions:
-        candidate = os.path.join(build_tools_dir, version, tool_name)
-        if os.path.exists(candidate):
-            return candidate
-    return shutil.which(tool_name)
-
-
-def _strip_archive_signatures(archive_path):
-    temporary = archive_path + ".unsigned"
-    signature_suffixes = (".SF", ".RSA", ".DSA", ".EC")
-    try:
-        with zipfile.ZipFile(archive_path, "r") as source:
-            with zipfile.ZipFile(temporary, "w") as target:
-                for item in source.infolist():
-                    upper = item.filename.upper()
-                    is_signature = upper == "META-INF/MANIFEST.MF" or (
-                        upper.startswith("META-INF/") and upper.endswith(signature_suffixes)
-                    )
-                    if is_signature:
-                        continue
-                    target.writestr(item, source.read(item))
-        os.replace(temporary, archive_path)
-    except Exception:
-        if os.path.exists(temporary):
-            os.remove(temporary)
-        raise
-
-
-async def _debug_sign_apk(apk_path, keystore, logs):
-    zipalign = _find_android_build_tool("zipalign")
-    apksigner = _find_android_build_tool("apksigner")
-    if not zipalign or not apksigner:
-        raise RuntimeError("zipalign atau apksigner tidak ditemui untuk debug signing")
-
-    _strip_archive_signatures(apk_path)
-    aligned_path = apk_path + ".aligned"
-    signed_path = apk_path + ".debug-signed"
-    try:
-        command = (
-            f"{shlex.quote(zipalign)} -P 16 -f 4 "
-            f"{shlex.quote(apk_path)} {shlex.quote(aligned_path)}"
-        )
-        code, output, error = await run_cmd(command, timeout=180)
-        if code != 0 or not os.path.exists(aligned_path):
-            raise RuntimeError(f"zipalign gagal: {(error or output)[-1000:]}")
-
-        command = (
-            f"{shlex.quote(apksigner)} sign --ks {shlex.quote(keystore)} "
-            "--ks-key-alias androiddebugkey --ks-pass pass:android "
-            "--key-pass pass:android --v4-signing-enabled false "
-            f"--out {shlex.quote(signed_path)} {shlex.quote(aligned_path)}"
-        )
-        code, output, error = await run_cmd(command, timeout=180)
-        if code != 0 or not os.path.exists(signed_path):
-            raise RuntimeError(f"apksigner gagal: {(error or output)[-1000:]}")
-
-        command = f"{shlex.quote(apksigner)} verify --verbose --print-certs {shlex.quote(signed_path)}"
-        code, output, error = await run_cmd(command, timeout=120)
-        if code != 0:
-            raise RuntimeError(f"Pengesahan APK gagal: {(error or output)[-1000:]}")
-
-        command = (
-            f"{shlex.quote(zipalign)} -c -P 16 -v 4 "
-            f"{shlex.quote(signed_path)}"
-        )
-        code, output, error = await run_cmd(command, timeout=120)
-        if code != 0:
-            raise RuntimeError(f"Pengesahan zipalign APK gagal: {(error or output)[-1000:]}")
-
-        os.replace(signed_path, apk_path)
-        logs.append(f"Debug signed and verified: {os.path.basename(apk_path)}")
-    finally:
-        for temporary in (aligned_path, signed_path):
-            if os.path.exists(temporary):
-                os.remove(temporary)
-
-
-async def _debug_sign_aab(aab_path, keystore, logs):
-    _strip_archive_signatures(aab_path)
-    signed_path = aab_path + ".debug-signed"
-    try:
-        command = (
-            "jarsigner -keystore " + shlex.quote(keystore)
-            + " -storepass android -keypass android"
-            + " -sigalg SHA256withRSA -digestalg SHA-256"
-            + " -signedjar " + shlex.quote(signed_path)
-            + " " + shlex.quote(aab_path)
-            + " androiddebugkey"
-        )
-        code, output, error = await run_cmd(command, timeout=180)
-        if code != 0 or not os.path.exists(signed_path):
-            raise RuntimeError(f"jarsigner AAB gagal: {(error or output)[-1000:]}")
-
-        command = f"jarsigner -verify -verbose {shlex.quote(signed_path)}"
-        code, output, error = await run_cmd(command, timeout=120)
-        verification_text = (output + "\n" + error).lower()
-        if code != 0 or "jar verified." not in verification_text:
-            raise RuntimeError(f"Pengesahan AAB gagal: {(error or output)[-1000:]}")
-
-        os.replace(signed_path, aab_path)
-        logs.append(f"Debug signed and verified: {os.path.basename(aab_path)}")
-    finally:
-        if os.path.exists(signed_path):
-            os.remove(signed_path)
-
-
-async def _debug_sign_apks(apks_path, keystore, logs):
-    temporary = apks_path + ".debug-signed"
-    work_dir = tempfile.mkdtemp(prefix="earlxz-apks-")
-    signed_count = 0
-    try:
-        with zipfile.ZipFile(apks_path, "r") as source:
-            with zipfile.ZipFile(temporary, "w") as target:
-                for index, item in enumerate(source.infolist()):
-                    if item.is_dir():
-                        target.writestr(item, b"")
-                        continue
-                    data = source.read(item)
-                    if item.filename.lower().endswith(".apk"):
-                        local_apk = os.path.join(work_dir, f"entry-{index}.apk")
-                        with open(local_apk, "wb") as output:
-                            output.write(data)
-                        await _debug_sign_apk(local_apk, keystore, logs)
-                        with open(local_apk, "rb") as signed_apk:
-                            data = signed_apk.read()
-                        signed_count += 1
-                    target.writestr(item, data)
-        if signed_count == 0:
-            raise RuntimeError("Fail APKS tidak mengandungi APK")
-        os.replace(temporary, apks_path)
-        logs.append(f"Debug signed APKS entries: {signed_count}")
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        if os.path.exists(temporary):
-            os.remove(temporary)
-
-
-def _is_release_apk(output_path):
-    normalized = output_path.replace("\\", "/").lower()
-    filename = os.path.basename(normalized)
-    return (
-        "/release/" in normalized
-        or "-release" in filename
-        or "_release" in filename
-        or "release-unsigned" in filename
-        or "release-unsigned" in normalized
-    )
-
-
-def _has_archive_signature_entries(archive_path):
-    signature_suffixes = (".SF", ".RSA", ".DSA", ".EC")
-    with zipfile.ZipFile(archive_path, "r") as archive:
-        for name in archive.namelist():
-            upper = name.upper()
-            if upper.startswith("META-INF/") and upper.endswith(signature_suffixes):
-                return True
-    return False
-
-
-async def _make_unsigned_release_apk(apk_path, logs):
-    _strip_archive_signatures(apk_path)
-    zipalign = _find_android_build_tool("zipalign")
-    if zipalign:
-        aligned_path = apk_path + ".aligned"
-        try:
-            command = (
-                f"{shlex.quote(zipalign)} -p -f 4 "
-                f"{shlex.quote(apk_path)} {shlex.quote(aligned_path)}"
-            )
-            code, output, error = await run_cmd(command, timeout=120)
-            if code != 0 or not os.path.exists(aligned_path):
-                raise RuntimeError(f"zipalign release APK gagal: {(error or output)[-1000:]}")
-            os.replace(aligned_path, apk_path)
-        finally:
-            if os.path.exists(aligned_path):
-                os.remove(aligned_path)
-    logs.append(f"Unsigned release APK ready: {os.path.basename(apk_path)}")
-
-
-async def prepare_outputs_for_delivery(result):
-    files = result.get("files", [])
-    logs = result.setdefault("logs", [])
-    if not files:
-        raise RuntimeError("Build berjaya tetapi tiada output untuk dihantar")
-
-    keystore = None
-    debug_signed = False
-    unsigned_release = False
-    debug_files = {os.path.abspath(path) for path in result.get("debug_files", [])}
-
-    async def get_debug_keystore():
-        nonlocal keystore
-        if keystore is None:
-            await _ensure_debug_signing_tools(logs)
-            keystore = await _ensure_debug_keystore(logs)
-        return keystore
-
-    for output_path in files:
-        if not os.path.exists(output_path):
-            raise RuntimeError(f"Output build tidak ditemui: {output_path}")
-        extension = os.path.splitext(output_path)[1].lower()
-
-        if extension == ".aab":
-            _strip_archive_signatures(output_path)
-            if _has_archive_signature_entries(output_path):
-                raise RuntimeError(f"AAB masih mempunyai signature selepas proses unsigned: {output_path}")
-            logs.append(f"Unsigned AAB ready for release signing: {os.path.basename(output_path)}")
-            unsigned_release = True
-        elif extension == ".apk" and os.path.abspath(output_path) in debug_files:
-            await _debug_sign_apk(output_path, await get_debug_keystore(), logs)
-            debug_signed = True
-        elif (
-            extension == ".apk"
-            and "release_failures" in result
-            and _is_release_apk(output_path)
-        ):
-            await _make_unsigned_release_apk(output_path, logs)
-            unsigned_release = True
-        elif extension == ".apk":
-            await _debug_sign_apk(output_path, await get_debug_keystore(), logs)
-            debug_signed = True
-        elif extension == ".apks":
-            await _debug_sign_apks(output_path, await get_debug_keystore(), logs)
-            debug_signed = True
-        else:
-            raise RuntimeError(f"Format output tidak disokong: {output_path}")
-
-    result["debug_signed"] = debug_signed
-    result["unsigned_release"] = unsigned_release
-    return result
-
-
-async def _configure_android_paths(engine, project_dir, logs, major, debug_keystore):
+async def _configure_android_paths(engine, project_dir, logs, major):
     project_file = os.path.join(project_dir, "project.godot")
     if not os.path.exists(project_file):
         raise RuntimeError("project.godot tidak ditemui semasa konfigurasi Android Godot")
@@ -860,15 +556,10 @@ func _enter_tree():
     var settings = get_editor_interface().get_editor_settings()
     var android_home = OS.get_environment("ANDROID_HOME")
     var java_home = OS.get_environment("JAVA_HOME")
-    var debug_keystore = OS.get_environment("EARLXZ_GODOT_DEBUG_KEYSTORE")
     if android_home != "":
         settings.set("export/android/android_sdk_path", android_home)
     if java_home != "":
         settings.set("export/android/java_sdk_path", java_home)
-    if debug_keystore != "":
-        settings.set("export/android/debug_keystore", debug_keystore)
-    settings.set("export/android/debug_keystore_user", "androiddebugkey")
-    settings.set("export/android/debug_keystore_pass", "android")
     var sentinel_path = OS.get_environment("EARLXZ_GODOT_SETUP_SENTINEL")
     if sentinel_path != "":
         var file = File.new()
@@ -885,15 +576,10 @@ func _enter_tree():
     var settings = get_editor_interface().get_editor_settings()
     var android_home = OS.get_environment("ANDROID_HOME")
     var java_home = OS.get_environment("JAVA_HOME")
-    var debug_keystore = OS.get_environment("EARLXZ_GODOT_DEBUG_KEYSTORE")
     if android_home != "":
         settings.set_setting("export/android/android_sdk_path", android_home)
     if java_home != "":
         settings.set_setting("export/android/java_sdk_path", java_home)
-    if debug_keystore != "":
-        settings.set_setting("export/android/debug_keystore", debug_keystore)
-    settings.set_setting("export/android/debug_keystore_user", "androiddebugkey")
-    settings.set_setting("export/android/debug_keystore_pass", "android")
     var sentinel_path = OS.get_environment("EARLXZ_GODOT_SETUP_SENTINEL")
     if sentinel_path != "":
         var file = FileAccess.open(sentinel_path, FileAccess.WRITE)
@@ -905,11 +591,7 @@ func _enter_tree():
     sentinel_dir = tempfile.mkdtemp(prefix="earlxz_godot_setup_")
     sentinel_path = os.path.join(sentinel_dir, "configured")
     managed_env = {
-        "EARLXZ_GODOT_DEBUG_KEYSTORE": os.path.abspath(debug_keystore),
         "EARLXZ_GODOT_SETUP_SENTINEL": sentinel_path,
-        "GODOT_ANDROID_KEYSTORE_DEBUG_PATH": os.path.abspath(debug_keystore),
-        "GODOT_ANDROID_KEYSTORE_DEBUG_USER": "androiddebugkey",
-        "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD": "android",
     }
     previous_env = {name: os.environ.get(name) for name in managed_env}
 
@@ -931,14 +613,14 @@ func _enter_tree():
         code, output, error = await run_cmd(command, timeout=180)
         if code != 0:
             raise RuntimeError(
-                "Godot gagal menyimpan Android SDK/JDK/debug keystore: "
+                "Godot gagal menyimpan tetapan Android SDK/JDK: "
                 + (error or output or "unknown Godot editor error")[-2000:]
             )
         if not os.path.exists(sentinel_path):
             raise RuntimeError(
                 "Plugin konfigurasi Android Godot tidak dijalankan; tetapan eksport tidak disahkan"
             )
-        logs.append("Godot Android SDK/JDK/debug keystore configured")
+        logs.append("Godot Android SDK/JDK configured tanpa mengubah signing projek")
     finally:
         try:
             with open(project_file, "wb") as output:
@@ -980,8 +662,7 @@ async def build_godot(project_dir, config):
     try:
         engine, version, major = await _setup_godot(project_dir, logs)
         await _setup_godot_android_requirements(version, logs)
-        debug_keystore = await _ensure_debug_keystore(logs)
-        await _configure_android_paths(engine, project_dir, logs, major, debug_keystore)
+        await _configure_android_paths(engine, project_dir, logs, major)
 
         preset_name, output_format = _find_android_preset(project_dir)
         if not preset_name:
@@ -1013,7 +694,7 @@ async def build_godot(project_dir, config):
                 "logs": logs,
             }
 
-        logs.append(f"Godot {version} output (debug signed): {os.path.basename(output_path)}")
+        logs.append(f"Godot {version} debug output: {os.path.basename(output_path)}")
         return {"success": True, "files": [output_path], "logs": logs}
     except Exception as error:
         logger.exception("Godot build setup failed")
@@ -1427,8 +1108,6 @@ async def main():
                 result = await build_godot(project_dir, config)
             else:
                 result = await build_project(project_dir, {"type": final_type, "config": config})
-            if result.get("success"):
-                result = await prepare_outputs_for_delivery(result)
     except Exception as error:
         logger.exception("Unhandled build worker error")
         result = {
@@ -1474,17 +1153,15 @@ async def main():
             release_failures = result.get("release_failures") or []
             if release_failures:
                 output_note = (
-                    "⚠️ Release build tidak lengkap/gagal. Debug APK yang berjaya tetap disertakan dengan debug signing.\n"
+                    "⚠️ Release build tidak lengkap/gagal. Debug APK yang berjaya tetap disertakan.\n"
                     "Semak RELEASE_BUILD_ERROR.txt dalam ZIP untuk log release.\n"
-                    "Jika ada AAB/release output, ia UNSIGNED dan perlu disign sekali dengan keystore sendiri."
-                )
-            elif result.get("unsigned_release"):
-                output_note = (
-                    "✅ AAB/release output adalah UNSIGNED. "
-                    "Sign sekali sahaja dengan upload/release keystore sendiri sebelum publish."
+                    "Signing output tidak diubah oleh builder; ia kekal mengikut konfigurasi projek."
                 )
             else:
-                output_note = "ℹ️ Debug output menggunakan debug signing untuk pemasangan/testing."
+                output_note = (
+                    "ℹ️ Signing output tidak diubah oleh builder; "
+                    "ia kekal mengikut konfigurasi projek."
+                )
 
             user_caption = "<blockquote>" + (
                 "<b>Build Successful!</b>\n\n"
