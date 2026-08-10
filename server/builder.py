@@ -4,6 +4,7 @@ import re
 import shutil
 import logging
 import zipfile
+import filecmp
 import aiohttp
 
 
@@ -320,11 +321,26 @@ def _snapshot_debug_apks(search_dirs, project_dir, logs):
         logs.append("Warning: debug build berjaya tetapi debug APK fallback tidak dapat disnapshot")
         return []
 
+    unique_candidates = []
+    for source in candidates:
+        duplicate = False
+        for existing in unique_candidates:
+            try:
+                if filecmp.cmp(source, existing, shallow=False):
+                    duplicate = True
+                    break
+            except OSError:
+                pass
+        if duplicate:
+            logs.append(f"Duplicate debug APK skipped: {os.path.basename(source)}")
+            continue
+        unique_candidates.append(source)
+
     fallback_dir = os.path.join(project_dir, ".builder_debug_fallback")
     os.makedirs(fallback_dir, exist_ok=True)
     snapshots = []
     used_names = set()
-    for index, source in enumerate(candidates, 1):
+    for index, source in enumerate(unique_candidates, 1):
         name = os.path.basename(source)
         if name in used_names:
             stem, ext = os.path.splitext(name)
