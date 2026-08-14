@@ -15,7 +15,7 @@ on:
         required: true
       project_type:
         description: 'Project Type'
-        required: true
+        required: false
       user_display:
         description: 'User display name'
         required: true
