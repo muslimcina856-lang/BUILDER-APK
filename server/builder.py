@@ -405,6 +405,54 @@ def _detect_project_java_version(android_dir):
     return highest
 
 
+def _flutter_sdk_min_versions():
+    """
+    Baca minimum dependency Android terus daripada Flutter SDK yang sedang
+    dipasang pada runner. Cari fail checker secara adaptif supaya perubahan
+    kecil pada lokasi/format source Flutter tidak menyebabkan semakan senyap.
+    """
+    flutter_root = os.environ.get("FLUTTER_ROOT") or "/tmp/flutter_sdk"
+    expected = os.path.join(
+        flutter_root,
+        "packages", "flutter_tools", "gradle", "src", "main", "kotlin",
+        "DependencyVersionChecker.kt",
+    )
+    checker = expected if os.path.exists(expected) else None
+    if checker is None and os.path.isdir(flutter_root):
+        for dirpath, dirs, files in os.walk(flutter_root):
+            dirs[:] = [d for d in dirs if d not in {".git", "bin", "cache"}]
+            if "DependencyVersionChecker.kt" in files:
+                checker = os.path.join(dirpath, "DependencyVersionChecker.kt")
+                break
+
+    result = {"gradle": None, "agp": None, "kgp": None}
+    if checker is None:
+        return result
+
+    try:
+        with open(checker, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        # Sengaja longgar pada type annotation/modifier. Yang penting ialah
+        # nama constant error* dan constructor version di sebelah kanan '='.
+        patterns = {
+            "gradle": r"\berrorGradleVersion\b[^=\n]*=\s*Version\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
+            "agp": r"\berrorAGPVersion\b[^=\n]*=\s*AndroidPluginVersion\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
+            "kgp": r"\berrorKGPVersion\b[^=\n]*=\s*Version\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
+        }
+        for key, pattern in patterns.items():
+            m = re.search(pattern, content)
+            if not m:
+                continue
+            parts = [int(m.group(1)), int(m.group(2)), int(m.group(3))]
+            while len(parts) > 2 and parts[-1] == 0:
+                parts.pop()
+            result[key] = ".".join(str(x) for x in parts)
+    except Exception:
+        pass
+    return result
+
+
 def _agp_to_min_gradle(agp_ver: str) -> str:
     """Map AGP version → minimum Gradle version required. Covers AGP 1.x–9.x."""
     try:
@@ -854,6 +902,50 @@ def _parse_agp_from_error(error_text):
         if highest is None or _ver_tuple(ver) > _ver_tuple(highest):
             highest = ver
     return highest
+
+
+def _parse_flutter_min_gradle_from_error(error_text):
+    """Ambil minimum Gradle terus daripada error dependency checker Flutter."""
+    m = re.search(
+        r"project(?:'s)?\s+Gradle\s+version\s*\([^)]*\).*?"
+        r"minimum\s+supported\s+version\s+of\s+([0-9]+(?:\.[0-9]+){1,2})",
+        error_text,
+        re.IGNORECASE | re.DOTALL,
+    )
+    return m.group(1) if m else None
+
+
+def _gradle_distribution_version(version):
+    """Flutter tulis 8.14.0; nama distribution rasmi Gradle ialah 8.14."""
+    parts = str(version).split(".")
+    while len(parts) > 2 and parts[-1] == "0":
+        parts.pop()
+    return ".".join(parts)
+
+
+def _upgrade_gradle_wrapper_minimum(android_dir, minimum, logs):
+    """Naikkan wrapper hanya jika lebih rendah daripada minimum Flutter."""
+    props_path = os.path.join(android_dir, "gradle", "wrapper", "gradle-wrapper.properties")
+    if not os.path.exists(props_path):
+        return False
+    try:
+        with open(props_path, "r", encoding="utf-8", errors="replace") as f:
+            pc = f.read()
+        m = re.search(r"gradle-([0-9.]+)-(bin|all)\.zip", pc)
+        if not m:
+            return False
+        current, dist_type = m.group(1), m.group(2)
+        if _ver_tuple(current) >= _ver_tuple(minimum):
+            return False
+        target = _gradle_distribution_version(minimum)
+        new_url = f"https\\://services.gradle.org/distributions/gradle-{target}-{dist_type}.zip"
+        new_pc = re.sub(r"distributionUrl=.*", f"distributionUrl={new_url}", pc)
+        with open(props_path, "w", encoding="utf-8") as f:
+            f.write(new_pc)
+        logs.append(f"Auto-fix: Flutter perlukan Gradle >= {minimum}; wrapper {current} → {target}")
+        return True
+    except Exception:
+        return False
 
 
 def _parse_gradle_dist_error(error_text):
@@ -1488,23 +1580,50 @@ async def fix_flutter_versions(project_dir, logs, required_agp_override=None):
     if cur_agp:
         logs.append(f"Info: AGP {cur_agp} detected")
 
-    # ── Step 3: Fix AGP HANYA kalau ada conflict dari dependency ────────────────
+    # ── Step 3: Fix AGP HANYA kalau ada conflict nyata ─────────────────────────
+    flutter_mins = _flutter_sdk_min_versions()
+    if any(flutter_mins.values()):
+        logs.append(
+            "Info: Flutter SDK minima — "
+            f"Gradle >= {flutter_mins.get('gradle') or '?'}, "
+            f"AGP >= {flutter_mins.get('agp') or '?'}, "
+            f"Kotlin >= {flutter_mins.get('kgp') or '?'}"
+        )
+    else:
+        logs.append("Warning: minimum Gradle/AGP/Kotlin Flutter SDK tak dapat dibaca; build retry fallback aktif")
+    flutter_min_agp = flutter_mins.get("agp")
+    effective_agp_override = required_agp_override
+    if flutter_min_agp and (
+        effective_agp_override is None
+        or _ver_tuple(effective_agp_override) < _ver_tuple(flutter_min_agp)
+    ):
+        effective_agp_override = flutter_min_agp
+
     final_agp = cur_agp
-    if required_agp_override and cur_agp and _ver_tuple(cur_agp) < _ver_tuple(required_agp_override):
-        final_agp = required_agp_override
+    if effective_agp_override and cur_agp and _ver_tuple(cur_agp) < _ver_tuple(effective_agp_override):
+        final_agp = effective_agp_override
         if agp_file and agp_match_start is not None:
             try:
                 with open(agp_file, "r", encoding="utf-8", errors="replace") as f:
                     fc = f.read()
-                new_fc = fc[:agp_match_start] + required_agp_override + fc[agp_match_end:]
+                new_fc = fc[:agp_match_start] + effective_agp_override + fc[agp_match_end:]
                 with open(agp_file, "w", encoding="utf-8") as f:
                     f.write(new_fc)
-                logs.append(f"Auto-fix: AGP {cur_agp} → {required_agp_override} (conflict dari dependency)")
+                logs.append(f"Auto-fix: AGP {cur_agp} → {effective_agp_override} (minimum diperlukan Flutter/dependency)")
             except Exception:
                 pass
 
-    # ── Step 4: Gradle wrapper — sesuai dengan AGP projek ───────────────────────
+    # ── Step 4: Gradle wrapper — sesuai dengan AGP DAN Flutter SDK ─────────────
     required_gradle = _agp_to_min_gradle(final_agp) if final_agp else None
+    gradle_reason = f"AGP {final_agp}" if final_agp else "projek"
+    flutter_min_gradle = flutter_mins.get("gradle")
+    if flutter_min_gradle and (
+        required_gradle is None
+        or _ver_tuple(required_gradle) < _ver_tuple(flutter_min_gradle)
+    ):
+        required_gradle = flutter_min_gradle
+        gradle_reason = "Flutter SDK"
+        logs.append(f"Info: Flutter SDK memerlukan Gradle >= {flutter_min_gradle}")
     props_path = os.path.join(android_dir, "gradle", "wrapper", "gradle-wrapper.properties")
 
     if os.path.exists(props_path):
@@ -1519,7 +1638,7 @@ async def fix_flutter_versions(project_dir, logs, required_agp_override=None):
                     new_pc = re.sub(r"distributionUrl=.*", f"distributionUrl={new_url}", pc)
                     with open(props_path, "w", encoding="utf-8") as f:
                         f.write(new_pc)
-                    logs.append(f"Auto-fix: Gradle {cur_gradle} → {required_gradle} (diperlukan oleh AGP {final_agp})")
+                    logs.append(f"Auto-fix: Gradle {cur_gradle} → {required_gradle} (diperlukan oleh {gradle_reason})")
                 else:
                     logs.append(f"Info: Gradle {cur_gradle} sesuai untuk projek ini")
         except Exception:
@@ -1542,6 +1661,10 @@ async def fix_flutter_versions(project_dir, logs, required_agp_override=None):
 
     # ── Step 5: libs.versions.toml — selaraskan ikut versi projek ───────────────
     proj_kotlin  = _detect_kotlin_version(android_dir) or _detect_kotlin_version(project_dir) or "1.0.0"
+    flutter_min_kgp = flutter_mins.get("kgp")
+    if flutter_min_kgp and _ver_tuple(proj_kotlin) < _ver_tuple(flutter_min_kgp):
+        logs.append(f"Auto-fix: Kotlin {proj_kotlin} → {flutter_min_kgp} (minimum diperlukan Flutter SDK)")
+        proj_kotlin = flutter_min_kgp
     proj_compile = _detect_sdk_value(android_dir, "compileSdk") or 1
     proj_target  = _detect_sdk_value(android_dir, "targetSdk") or 1
     proj_min_sdk = _detect_sdk_value(android_dir, "minSdk") or 1
@@ -1607,6 +1730,15 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
         return code, out, err
 
     combined = (err or "") + (out or "")
+
+    # ── Retry 0: Flutter sendiri menolak Gradle terlalu rendah ────────────────
+    # Ini fallback kedua jika pembacaan DependencyVersionChecker berubah/gagal.
+    flutter_min_gradle = _parse_flutter_min_gradle_from_error(combined)
+    if flutter_min_gradle and _upgrade_gradle_wrapper_minimum(android_dir, flutter_min_gradle, logs):
+        code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
+        if code == 0:
+            return code, out, err
+        combined = (err or "") + (out or "")
 
     # ── Retry 1: NDK version conflict ──────────────────────────────────────────
     ndk_required = _parse_ndk_from_error(combined)
