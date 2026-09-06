@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -16,7 +17,12 @@ from urllib.parse import unquote, urlparse
 import aiohttp
 
 from builder import build_project, run_cmd, setup_java
-from upload_handler import upload_gofile, send_telegram_notification, send_telegram_document
+from upload_handler import (
+    download_telegram_document_reference,
+    upload_gofile,
+    send_telegram_notification,
+    send_telegram_document,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -1553,6 +1559,122 @@ def get_java_version_for_project(project_dir):
     return str(max(candidates + [agp_minimum, 17]))
 
 
+
+PROJECT_TYPE_DISPLAY = {
+    "native": "Android Native",
+    "flutter": "Flutter",
+    "smali": "Smali (APKTool)",
+    "react_native": "React Native",
+    "cordova": "Cordova",
+    "ionic": "Ionic",
+    "capacitor": "Capacitor",
+    "godot": "Godot",
+}
+
+
+def _project_name_hint(project_dir, project_type):
+    if project_type == "godot":
+        content = _read_text(os.path.join(project_dir, "project.godot"))
+        match = re.search(r'(?m)^config/name\s*=\s*["\x27](.*?)["\x27]\s*$', content)
+        if match:
+            return match.group(1).strip()
+
+    if project_type == "flutter":
+        content = _read_text(os.path.join(project_dir, "pubspec.yaml"))
+        match = re.search(r'(?m)^name\s*:\s*["\x27]?([^\s#"\x27]+)', content)
+        if match:
+            return match.group(1).strip()
+
+    if project_type in ("react_native", "cordova", "ionic", "capacitor"):
+        try:
+            with open(os.path.join(project_dir, "package.json"), "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            name = str(data.get("name", "")).strip()
+            if name:
+                return name
+        except Exception:
+            pass
+
+    if project_type == "native":
+        for filename in ("settings.gradle", "settings.gradle.kts"):
+            content = _read_text(os.path.join(project_dir, filename))
+            match = re.search(r'rootProject\.name\s*=\s*["\x27]([^"\x27]+)', content)
+            if match:
+                return match.group(1).strip()
+
+    return ""
+
+
+def make_project_detection_message(
+    project_dir,
+    build_dir,
+    project_type,
+    target_file,
+    java_version=None,
+    flutter_version=None,
+):
+    """Create the early project-information notification sent before compilation."""
+    display = PROJECT_TYPE_DISPLAY.get(project_type, project_type or "Unknown")
+    relative = os.path.relpath(project_dir, build_dir)
+    root_label = "/" if relative == "." else relative.replace(os.sep, "/")
+    name = _project_name_hint(project_dir, project_type)
+
+    lines = [
+        "<blockquote><b>PROJECT DETECTED</b>",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"◆ File: <code>{html.escape(str(target_file))}</code>",
+        f"◆ Framework: <b>{html.escape(str(display))}</b>",
+        f"◆ Root: <code>{html.escape(root_label)}</code>",
+    ]
+    if name:
+        lines.append(f"◆ Project: <code>{html.escape(name)}</code>")
+
+    if project_type == "godot":
+        version = _detect_version_hint(project_dir)
+        kind = "C# / .NET" if _detect_godot_project_kind(project_dir) == "dotnet" else "GDScript / Standard"
+        lines.append(f"◆ Godot: <code>{html.escape(version)}</code>")
+        lines.append(f"◆ Runtime: <code>{kind}</code>")
+    elif project_type == "flutter":
+        lines.append(f"◆ Flutter: <code>{html.escape(str(flutter_version or 'stable'))}</code>")
+        if java_version:
+            lines.append(f"◆ Java: <code>{html.escape(str(java_version))}</code>")
+    elif java_version and project_type != "smali":
+        lines.append(f"◆ Java: <code>{html.escape(str(java_version))}</code>")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "🚀 Detection selesai. Build diteruskan...",
+        "</blockquote>",
+    ])
+    return "\n".join(lines)
+
+
+def make_project_not_detected_message(target_file):
+    return "\n".join([
+        "<blockquote><b>PROJECT NOT DETECTED</b>",
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"◆ File: <code>{html.escape(str(target_file))}</code>",
+        "◆ Status: <b>Jenis projek tidak dapat dikesan</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "Framework yang disokong:",
+        "• Android Native",
+        "• Flutter",
+        "• Smali (APKTool)",
+        "• React Native",
+        "• Cordova",
+        "• Ionic",
+        "• Capacitor",
+        "• Godot",
+        "",
+        "Build dihentikan sebelum proses compile.",
+        "</blockquote>",
+    ])
+
+
 def detect_project_type(project_dir):
     """Detect the project type from its files only; no user-provided hint is used."""
 
@@ -1773,44 +1895,75 @@ async def main():
             logger.exception("Gagal menghantar ralat TARGET_FILE ke Telegram")
         return 1
 
+    source_mode = os.getenv("SOURCE_MODE", "repo").strip().lower() or "repo"
     submitted_file = os.path.join("temp", target_file)
     source_zip = submitted_file
     downloaded_zip = None
+    direct_source_dir = None
     build_dir = "build_area"
 
-    if not os.path.exists(source_zip):
-        result = {
-            "success": False,
-            "error": f"Source zip not found: {source_zip}",
-            "logs": [f"TARGET_FILE decoded as: {target_file}"],
-        }
-        logger.error(result["error"])
-        await send_failure(
-            bot_token, chat_id, user_display, "unknown", result, build_dir, target_file
-        )
-        return 1
-
-    if target_file.lower().endswith(".txt"):
+    if source_mode == "telegram":
+        direct_source_dir = tempfile.mkdtemp(prefix="builder_source_")
+        downloaded_zip = os.path.join(direct_source_dir, target_file)
         try:
-            with open(source_zip, "r", encoding="utf-8", errors="replace") as f:
-                download_url = f.read().strip()
-            if not download_url.startswith(("http://", "https://")):
-                raise RuntimeError("Pautan projek tidak sah")
-            downloaded_zip = os.path.splitext(source_zip)[0] + ".zip"
-            logger.info("Downloading project from submitted link")
-            await download_project_link(download_url, downloaded_zip)
+            logger.info("Downloading project directly from Telegram on GitHub runner")
+            await download_telegram_document_reference(
+                bot_token=bot_token,
+                document_id=os.getenv("TELEGRAM_DOCUMENT_ID", ""),
+                access_hash=os.getenv("TELEGRAM_ACCESS_HASH", ""),
+                file_reference_b64=os.getenv("TELEGRAM_FILE_REFERENCE", ""),
+                dc_id=os.getenv("TELEGRAM_DC_ID", ""),
+                file_size=os.getenv("TELEGRAM_FILE_SIZE", ""),
+                destination=downloaded_zip,
+            )
             source_zip = downloaded_zip
-            logger.info("Project download completed")
+            logger.info("Direct Telegram project download completed")
         except Exception as error:
             result = {
                 "success": False,
-                "error": f"Gagal memuat turun projek daripada pautan: {error}",
+                "error": f"Gagal memuat turun projek terus daripada Telegram: {error}",
                 "logs": [],
             }
             await send_failure(
                 bot_token, chat_id, user_display, "unknown", result, build_dir, target_file
             )
+            if direct_source_dir:
+                shutil.rmtree(direct_source_dir, ignore_errors=True)
             return 1
+    else:
+        if not os.path.exists(source_zip):
+            result = {
+                "success": False,
+                "error": f"Source zip not found: {source_zip}",
+                "logs": [f"TARGET_FILE decoded as: {target_file}"],
+            }
+            logger.error(result["error"])
+            await send_failure(
+                bot_token, chat_id, user_display, "unknown", result, build_dir, target_file
+            )
+            return 1
+
+        if target_file.lower().endswith(".txt"):
+            try:
+                with open(source_zip, "r", encoding="utf-8", errors="replace") as f:
+                    download_url = f.read().strip()
+                if not download_url.startswith(("http://", "https://")):
+                    raise RuntimeError("Pautan projek tidak sah")
+                downloaded_zip = os.path.splitext(source_zip)[0] + ".zip"
+                logger.info("Downloading project from submitted link")
+                await download_project_link(download_url, downloaded_zip)
+                source_zip = downloaded_zip
+                logger.info("Project download completed")
+            except Exception as error:
+                result = {
+                    "success": False,
+                    "error": f"Gagal memuat turun projek daripada pautan: {error}",
+                    "logs": [],
+                }
+                await send_failure(
+                    bot_token, chat_id, user_display, "unknown", result, build_dir, target_file
+                )
+                return 1
 
     try:
         os.makedirs(build_dir, exist_ok=True)
@@ -1835,6 +1988,12 @@ async def main():
         logger.info(f"Project type detected: {final_type or 'unknown'}")
 
         if not final_type:
+            try:
+                await send_telegram_notification(
+                    bot_token, chat_id, make_project_not_detected_message(target_file)
+                )
+            except Exception:
+                logger.exception("Gagal menghantar status project-not-detected")
             result = {
                 "success": False,
                 "error": "Jenis projek tidak dapat dikesan daripada kandungan ZIP.",
@@ -1860,6 +2019,21 @@ async def main():
                 "old_flutter_style": old_flutter_style,
             }
             logger.info(f"Targeting Java {java_version} for {final_type} project")
+            try:
+                await send_telegram_notification(
+                    bot_token,
+                    chat_id,
+                    make_project_detection_message(
+                        project_dir,
+                        build_dir,
+                        final_type,
+                        target_file,
+                        java_version=java_version,
+                        flutter_version=flutter_version,
+                    ),
+                )
+            except Exception:
+                logger.exception("Gagal menghantar maklumat projek sebelum build")
 
             if final_type == "godot":
                 result = await build_godot(project_dir, config)
@@ -1956,11 +2130,13 @@ async def main():
 
     shutil.rmtree(build_dir, ignore_errors=True)
     for path in {source_zip, downloaded_zip}:
-        if path and os.path.exists(path):
+        if path and os.path.isfile(path):
             try:
                 os.remove(path)
             except OSError:
                 pass
+    if direct_source_dir:
+        shutil.rmtree(direct_source_dir, ignore_errors=True)
 
     return exit_code
 

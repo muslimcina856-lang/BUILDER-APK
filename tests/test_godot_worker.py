@@ -20,6 +20,7 @@ async def _noop(*args, **kwargs):
 upload_stub.upload_gofile = _noop
 upload_stub.send_telegram_notification = _noop
 upload_stub.send_telegram_document = _noop
+upload_stub.download_telegram_document_reference = _noop
 sys.modules.setdefault("upload_handler", upload_stub)
 
 worker = importlib.import_module("worker")

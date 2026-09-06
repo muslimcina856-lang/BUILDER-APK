@@ -28,6 +28,30 @@ on:
       api_hash:
         description: 'Telethon API Hash'
         required: true
+      source_mode:
+        description: 'Project source mode: repo or telegram'
+        required: false
+        default: 'repo'
+      telegram_document_id:
+        description: 'Telegram document ID for direct runner download'
+        required: false
+        default: ''
+      telegram_access_hash:
+        description: 'Telegram document access hash'
+        required: false
+        default: ''
+      telegram_file_reference:
+        description: 'Base64 Telegram file reference'
+        required: false
+        default: ''
+      telegram_dc_id:
+        description: 'Telegram document DC ID'
+        required: false
+        default: ''
+      telegram_file_size:
+        description: 'Telegram document size in bytes'
+        required: false
+        default: ''
       godot_preset:
         description: 'Godot Android preset name (optional; runnable/first preset if empty)'
         required: false
@@ -84,6 +108,12 @@ jobs:
           TARGET_FILE: ${{ github.event.inputs.target }}
           API_ID: ${{ github.event.inputs.api_id }}
           API_HASH: ${{ github.event.inputs.api_hash }}
+          SOURCE_MODE: ${{ github.event.inputs.source_mode }}
+          TELEGRAM_DOCUMENT_ID: ${{ github.event.inputs.telegram_document_id }}
+          TELEGRAM_ACCESS_HASH: ${{ github.event.inputs.telegram_access_hash }}
+          TELEGRAM_FILE_REFERENCE: ${{ github.event.inputs.telegram_file_reference }}
+          TELEGRAM_DC_ID: ${{ github.event.inputs.telegram_dc_id }}
+          TELEGRAM_FILE_SIZE: ${{ github.event.inputs.telegram_file_size }}
           GITHUB_TOKEN: ${{ github.token }}
           GODOT_PRESET: ${{ github.event.inputs.godot_preset }}
           GODOT_EXPORT_MODE: ${{ github.event.inputs.godot_export_mode }}
