@@ -111,8 +111,8 @@ class GodotWorkerHelperTests(unittest.TestCase):
         self.assertEqual(worker._godot_cli_prefix(server, 3), server)
         self.assertIn("--headless", worker._godot_cli_prefix("/tmp/godot4", 4))
 
-    def test_export_mode_auto_adds_release_only_when_signing_available(self):
-        self.assertEqual(worker._export_variants("auto", has_release_signing=False), ["debug"])
+    def test_export_mode_auto_always_includes_unsigned_release(self):
+        self.assertEqual(worker._export_variants("auto", has_release_signing=False), ["debug", "release"])
         self.assertEqual(worker._export_variants("auto", has_release_signing=True), ["debug", "release"])
         self.assertEqual(worker._export_variants("debug", has_release_signing=True), ["debug"])
         self.assertEqual(worker._export_variants("release", has_release_signing=True), ["release"])
@@ -180,31 +180,6 @@ class GodotWorkerHelperTests(unittest.TestCase):
             self.assertEqual(len(warnings), 1)
             self.assertIn("Android", warnings[0])
 
-    def test_prepare_release_signing_accepts_base64_keystore_secret(self):
-        import base64
-
-        temp, root = self.make_project()
-        encoded = base64.b64encode(b"fake-keystore-binary").decode("ascii")
-        with temp, mock.patch.dict(os.environ, {
-            "GODOT_RELEASE_KEYSTORE_BASE64": encoded,
-            "GODOT_RELEASE_KEYSTORE_USER": "game",
-            "GODOT_RELEASE_KEYSTORE_PASSWORD": "secret",
-        }, clear=False):
-            for key in (
-                "GODOT_RELEASE_KEYSTORE_PATH",
-                "GODOT_ANDROID_KEYSTORE_RELEASE_PATH",
-                "GODOT_ANDROID_KEYSTORE_RELEASE_USER",
-                "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD",
-            ):
-                os.environ.pop(key, None)
-            logs = []
-            self.assertTrue(worker._prepare_release_signing_environment(str(root), logs))
-            key_path = Path(os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PATH"])
-            self.assertTrue(key_path.exists())
-            self.assertEqual(key_path.read_bytes(), b"fake-keystore-binary")
-            self.assertNotIn(encoded, "\n".join(logs))
-            self.assertNotIn("secret", "\n".join(logs))
-
     def test_godot3_gradle_template_falls_back_to_android_source_zip(self):
         temp, root = self.make_project()
         data_home = tempfile.TemporaryDirectory()
@@ -225,27 +200,6 @@ class GodotWorkerHelperTests(unittest.TestCase):
             self.assertTrue((root / "android" / "build" / "build.gradle").exists())
             self.assertTrue((root / "android" / ".build_version").exists())
 
-    def test_prepare_release_signing_resolves_project_relative_secret_path(self):
-        temp, root = self.make_project(files={"signing/release.jks": "key"})
-        with temp, mock.patch.dict(os.environ, {
-            "GODOT_RELEASE_KEYSTORE_PATH": "signing/release.jks",
-            "GODOT_RELEASE_KEYSTORE_USER": "game",
-            "GODOT_RELEASE_KEYSTORE_PASSWORD": "secret",
-        }, clear=False):
-            for key in (
-                "GODOT_ANDROID_KEYSTORE_RELEASE_PATH",
-                "GODOT_ANDROID_KEYSTORE_RELEASE_USER",
-                "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD",
-            ):
-                os.environ.pop(key, None)
-            logs = []
-            self.assertTrue(worker._prepare_release_signing_environment(str(root), logs))
-            self.assertEqual(
-                os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PATH"],
-                str(root / "signing" / "release.jks"),
-            )
-            self.assertEqual(os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_USER"], "game")
-            self.assertNotIn("secret", "\n".join(logs))
 
 
 class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
@@ -261,11 +215,22 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         return temp, root
 
     async def _successful_export_cmd(self, command, cwd=None, timeout=1200):
+        import zipfile
         args = shlex.split(command)
+        if "keytool" in args and "-keystore" in args:
+            key_path = Path(args[args.index("-keystore") + 1])
+            key_path.parent.mkdir(parents=True, exist_ok=True)
+            key_path.write_bytes(b"temporary-key")
+            return 0, "", ""
         if any(flag in args for flag in ("--export-debug", "--export-release", "--export")):
             output = Path(args[-1])
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_bytes(b"artifact")
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("assets/game.pck", b"artifact")
+                if "release" in output.name:
+                    archive.writestr("META-INF/MANIFEST.MF", b"manifest")
+                    archive.writestr("META-INF/BUILDER.SF", b"signature")
+                    archive.writestr("META-INF/BUILDER.RSA", b"signature")
         return 0, "", ""
 
     async def test_configure_android_paths_restores_project_file_exactly(self):
@@ -331,7 +296,7 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"], result)
         self.assertEqual(restored, linux_only)
 
-    async def test_standard_auto_mode_exports_debug_only_without_release_signing(self):
+    async def test_standard_auto_mode_exports_debug_and_unsigned_release_without_user_signing(self):
         preset = '''[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ngradle_build/use_gradle_build=false\ngradle_build/export_format=0\n'''
         temp, root = self.make_project('config_version=5\nconfig/features=PackedStringArray("4.7")\n', preset)
         with temp, \
@@ -342,12 +307,15 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=self._successful_export_cmd)) as run:
             result = await worker.build_godot(str(root), {"godot_export_mode": "auto"})
         self.assertTrue(result["success"])
-        self.assertEqual([Path(path).name for path in result["files"]], ["app-debug.apk"])
+        self.assertEqual(
+            [Path(path).name for path in result["files"]],
+            ["app-debug.apk", "app-release-unsigned.apk"],
+        )
         commands = "\n".join(call.args[0] for call in run.await_args_list)
         self.assertIn("--export-debug", commands)
-        self.assertNotIn("--export-release", commands)
+        self.assertIn("--export-release", commands)
 
-    async def test_auto_mode_exports_debug_and_release_when_signing_is_configured(self):
+    async def test_auto_mode_ignores_user_signing_and_outputs_unsigned_release(self):
         preset = '''[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ngradle_build/use_gradle_build=false\ngradle_build/export_format=0\nkeystore/release="res://release.keystore"\nkeystore/release_user="game"\nkeystore/release_password="secret"\n'''
         temp, root = self.make_project('config_version=5\nconfig/features=PackedStringArray("4.7")\n', preset)
         with temp, \
@@ -360,7 +328,7 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["success"])
         self.assertEqual(
             [Path(path).name for path in result["files"]],
-            ["app-debug.apk", "app-release.apk"],
+            ["app-debug.apk", "app-release-unsigned.apk"],
         )
         commands = "\n".join(call.args[0] for call in run.await_args_list)
         self.assertIn("--export-debug", commands)
@@ -418,7 +386,7 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("--export-release", commands)
         self.assertNotIn("--no-window", commands)
 
-    async def test_godot3_secure_signing_is_injected_temporarily_and_restored(self):
+    async def test_godot3_user_signing_is_replaced_temporarily_and_preset_restored(self):
         preset = '[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ncustom_build/use_custom_build=false\n'
         temp, root = self.make_project(
             'config_version=4\nconfig/features=PoolStringArray("3.6")\n', preset,
@@ -428,14 +396,19 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         seen = {}
 
         async def signed_export(command, cwd=None, timeout=1200):
+            args = shlex.split(command)
+            if "keytool" in args:
+                return await self._successful_export_cmd(command, cwd=cwd, timeout=timeout)
             current = (root / "export_presets.cfg").read_text(encoding="utf-8")
-            seen["preset"] = current
-            if (
-                'keystore/release="' not in current
-                or 'keystore/release_user="game"' not in current
-                or 'keystore/release_password="secret"' not in current
-            ):
-                return 1, "", "Godot 3 release signing was not bridged into preset"
+            if any(flag in args for flag in ("--export", "--export-release")):
+                seen["preset"] = current
+                if (
+                    'keystore/release_user="earlxztemporary"' not in current
+                    or 'keystore/release_password="EarlxzUnsignedTemp2026"' not in current
+                    or 'keystore/release_user="game"' in current
+                    or 'keystore/release_password="secret"' in current
+                ):
+                    return 1, "", "Godot 3 temporary signing identity was not injected"
             return await self._successful_export_cmd(command, cwd=cwd, timeout=timeout)
 
         env = {
@@ -459,10 +432,11 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
             restored = (root / "export_presets.cfg").read_bytes()
 
         self.assertTrue(result["success"], result)
-        self.assertIn('keystore/release_user="game"', seen["preset"])
+        self.assertIn('keystore/release_user="earlxztemporary"', seen["preset"])
+        self.assertNotIn('keystore/release_user="game"', seen["preset"])
         self.assertEqual(restored, original)
 
-    async def test_base64_release_keystore_is_removed_after_build(self):
+    async def test_user_release_keystore_secrets_are_ignored_and_temp_key_removed(self):
         import base64
 
         preset = '[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ngradle_build/use_gradle_build=false\n'
@@ -472,7 +446,10 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         seen = {}
 
         async def capture_export(command, cwd=None, timeout=1200):
-            seen["path"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH")
+            args = shlex.split(command)
+            if any(flag in args for flag in ("--export-release", "--export")):
+                seen["path"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH")
+                seen["user"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER")
             return await self._successful_export_cmd(command, cwd=cwd, timeout=timeout)
 
         env = {
@@ -497,9 +474,11 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(result["success"], result)
         self.assertTrue(seen.get("path"))
+        self.assertEqual(seen.get("user"), "earlxztemporary")
+        self.assertNotEqual(seen.get("path"), str(root / "signing" / "release.jks"))
         self.assertFalse(Path(seen["path"]).exists())
 
-    async def test_release_only_without_signing_fails_before_export(self):
+    async def test_release_only_without_user_signing_builds_unsigned(self):
         preset = '''[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ngradle_build/use_gradle_build=false\ngradle_build/export_format=0\n'''
         temp, root = self.make_project('config_version=5\nconfig/features=PackedStringArray("4.7")\n', preset)
         run = mock.AsyncMock(side_effect=self._successful_export_cmd)
@@ -510,9 +489,122 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
              mock.patch.object(worker, "run_cmd", new=run):
             result = await worker.build_godot(str(root), {"godot_export_mode": "release"})
-        self.assertFalse(result["success"])
-        self.assertIn("release keystore", result["error"].lower())
-        run.assert_not_awaited()
+        self.assertTrue(result["success"], result)
+        self.assertEqual([Path(path).name for path in result["files"]], ["app-release-unsigned.apk"])
+        self.assertTrue(run.await_count > 0)
+
+class GodotUnsignedReleasePolicyTests(unittest.IsolatedAsyncioTestCase):
+    def make_project(self, preset_text):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        (root / "project.godot").write_text(
+            'config_version=5\nconfig/features=PackedStringArray("4.7")\n',
+            encoding="utf-8",
+        )
+        (root / "export_presets.cfg").write_text(preset_text, encoding="utf-8")
+        return temp, root
+
+    async def _zip_export_cmd(self, command, cwd=None, timeout=1200):
+        import zipfile
+        args = shlex.split(command)
+        if any(flag in args for flag in ("--export-debug", "--export-release", "--export")):
+            output = Path(args[-1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("assets/game.pck", b"game")
+                if "release" in output.name:
+                    archive.writestr("META-INF/MANIFEST.MF", b"manifest")
+                    archive.writestr("META-INF/BUILDER.SF", b"signature")
+                    archive.writestr("META-INF/BUILDER.RSA", b"signature")
+        return 0, "", ""
+
+    async def test_auto_mode_always_includes_release_even_without_user_signing(self):
+        self.assertEqual(worker._export_variants("auto", False), ["debug", "release"])
+        self.assertEqual(worker._export_variants("auto", True), ["debug", "release"])
+
+    async def test_release_artifact_is_rewritten_as_unsigned(self):
+        import zipfile
+        temp = tempfile.TemporaryDirectory()
+        with temp:
+            source = Path(temp.name) / "app-release.aab"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("base/manifest/AndroidManifest.xml", b"manifest")
+                archive.writestr("META-INF/MANIFEST.MF", b"signed")
+                archive.writestr("META-INF/CERT.SF", b"signed")
+                archive.writestr("META-INF/CERT.RSA", b"signed")
+            result = await worker._make_android_artifact_unsigned(str(source), [])
+            self.assertEqual(Path(result).name, "app-release-unsigned.aab")
+            self.assertFalse(source.exists())
+            with zipfile.ZipFile(result, "r") as archive:
+                names = set(archive.namelist())
+            self.assertIn("base/manifest/AndroidManifest.xml", names)
+            self.assertNotIn("META-INF/MANIFEST.MF", names)
+            self.assertNotIn("META-INF/CERT.SF", names)
+            self.assertNotIn("META-INF/CERT.RSA", names)
+
+    async def test_user_release_keystore_is_ignored_and_final_release_is_unsigned(self):
+        preset = ('[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n'
+                  '[preset.0.options]\ngradle_build/use_gradle_build=false\n'
+                  'gradle_build/export_format=0\n'
+                  'keystore/release="res://user-release.keystore"\n'
+                  'keystore/release_user="useralias"\n'
+                  'keystore/release_password="usersecret"\n')
+        temp, root = self.make_project(preset)
+        user_key = root / "user-release.keystore"
+        user_key.write_bytes(b"user-key")
+        temp_key = root / "builder-temp.keystore"
+        temp_key.write_bytes(b"temporary-key")
+        seen = {}
+
+        async def capture_export(command, cwd=None, timeout=1200):
+            if "--export-release" in command:
+                seen["path"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH")
+                seen["user"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER")
+                seen["password"] = os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD")
+            return await self._zip_export_cmd(command, cwd=cwd, timeout=timeout)
+
+        env = {
+            "GODOT_ANDROID_KEYSTORE_RELEASE_PATH": str(user_key),
+            "GODOT_ANDROID_KEYSTORE_RELEASE_USER": "useralias",
+            "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD": "usersecret",
+            "GODOT_RELEASE_KEYSTORE_PATH": str(user_key),
+            "GODOT_RELEASE_KEYSTORE_USER": "useralias",
+            "GODOT_RELEASE_KEYSTORE_PASSWORD": "usersecret",
+        }
+        with temp, mock.patch.dict(os.environ, env, clear=False), \
+             mock.patch.object(worker, "_setup_godot", new=mock.AsyncMock(return_value=("/fake/godot", "4.7.2", 4))), \
+             mock.patch.object(worker, "_setup_godot_android_requirements", new=mock.AsyncMock(return_value={})), \
+             mock.patch.object(worker, "_ensure_godot_debug_keystore", new=mock.AsyncMock(return_value=str(root / "debug.keystore"))), \
+             mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_prepare_temporary_release_signing", new=mock.AsyncMock(return_value={"path": str(temp_key), "user": "buildertemp", "password": "builderpass"})), \
+             mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=capture_export)):
+            result = await worker.build_godot(str(root), {"godot_export_mode": "release"})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(seen.get("path"), str(temp_key))
+        self.assertEqual(seen.get("user"), "buildertemp")
+        self.assertNotEqual(seen.get("path"), str(user_key))
+        self.assertNotEqual(seen.get("password"), "usersecret")
+        self.assertEqual([Path(path).name for path in result["files"]], ["app-release-unsigned.apk"])
+
+    async def test_release_without_user_signing_still_builds_unsigned(self):
+        preset = ('[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n'
+                  '[preset.0.options]\ngradle_build/use_gradle_build=false\n'
+                  'gradle_build/export_format=0\n')
+        temp, root = self.make_project(preset)
+        temp_key = root / "builder-temp.keystore"
+        temp_key.write_bytes(b"temporary-key")
+        with temp, \
+             mock.patch.object(worker, "_setup_godot", new=mock.AsyncMock(return_value=("/fake/godot", "4.7.2", 4))), \
+             mock.patch.object(worker, "_setup_godot_android_requirements", new=mock.AsyncMock(return_value={})), \
+             mock.patch.object(worker, "_ensure_godot_debug_keystore", new=mock.AsyncMock(return_value=str(root / "debug.keystore"))), \
+             mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_prepare_temporary_release_signing", new=mock.AsyncMock(return_value={"path": str(temp_key), "user": "buildertemp", "password": "builderpass"})), \
+             mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=self._zip_export_cmd)):
+            result = await worker.build_godot(str(root), {"godot_export_mode": "release"})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual([Path(path).name for path in result["files"]], ["app-release-unsigned.apk"])
 
 
 if __name__ == "__main__":

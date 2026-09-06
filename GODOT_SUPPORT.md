@@ -7,13 +7,31 @@ Builder ini menyediakan laluan eksport Android khusus untuk projek Godot tanpa m
 - Godot 3.x dan Godot 4.x GDScript menggunakan release stabil yang sepadan dengan `project.godot`.
 - Godot 3.x C#/Mono menggunakan binary dan export templates Mono serta .NET SDK.
 - Godot 4.2+ C#/.NET untuk Android menggunakan binary dan export templates .NET. Godot 4.0/4.1 C# Android tidak dipaksa kerana upstream belum menyokong eksport Android untuk C# pada versi itu.
-- APK debug dan release.
-- AAB melalui Gradle build.
+- APK debug.
+- APK release **unsigned**.
+- AAB release **unsigned** melalui Gradle build.
 - Lebih daripada satu Android export preset, termasuk pemilihan preset tertentu atau build semua preset.
 - Pemasangan Android Gradle build template secara automatik apabila preset memerlukannya, tanpa menindih `android/build` custom yang sudah berisi.
 - Debug keystore automatik untuk runner bersih.
-- Release signing melalui preset projek atau secret CI.
 - Pemeriksaan asas Android plugin dan GDExtension/GDNative supaya library Android yang hilang diberi amaran awal.
+
+## Polisi signing V5 Direct Runner
+
+Release signing oleh builder dimatikan sebagai polisi tetap.
+
+- Keystore release yang berada dalam projek tidak digunakan sebagai identiti akhir.
+- Secret atau environment release keystore user tidak diperlukan dan tidak dihantar oleh workflow.
+- `auto` membina debug + release walaupun user tidak menyediakan keystore.
+- `release` membina release sahaja.
+- `both` membina debug + release.
+- Semua APK/AAB release yang dihantar kepada user dinamakan dengan suffix `-unsigned`.
+- User wajib sign sendiri selepas menerima artifact.
+
+Sesetengah versi Godot memerlukan identiti signing semasa proses eksport release walaupun artifact akhirnya mahu disediakan unsigned. Untuk compatibility, runner menjana identiti sementara miliknya sendiri, menggunakannya hanya semasa proses packaging, kemudian membina semula artifact untuk membuang signature dan memadam keystore sementara tersebut. Identiti/keystore user tidak digunakan untuk proses ini.
+
+Untuk APK, builder cuba menjalankan `zipalign` semula selepas signature dibuang supaya fail lebih bersedia untuk proses signing user. Untuk AAB, signature JAR/Gradle yang wujud dibuang daripada artifact akhir.
+
+Debug APK kekal menggunakan debug keystore kerana ia ialah build debug, bukan artifact release untuk Play Store.
 
 ## Pilihan workflow
 
@@ -21,8 +39,6 @@ Input `workflow_dispatch`:
 
 - `godot_preset`: nama Android export preset. Jika kosong, preset `runnable` digunakan dahulu, kemudian preset Android pertama.
 - `godot_export_mode`: `auto`, `debug`, `release`, atau `both`.
-  - `auto` menghasilkan debug sahaja jika release signing tiada.
-  - `auto` menghasilkan debug + release jika release signing tersedia.
 - `godot_build_all_presets`: `true` untuk eksport semua Android preset.
 
 Environment yang sama juga boleh digunakan apabila worker dijalankan di luar GitHub Actions:
@@ -33,27 +49,7 @@ GODOT_EXPORT_MODE
 GODOT_BUILD_ALL_PRESETS
 ```
 
-## Release signing yang selamat
-
-Pilihan yang disyorkan untuk GitHub Actions ialah menyimpan keystore sebagai Base64 secret:
-
-```text
-GODOT_RELEASE_KEYSTORE_BASE64
-GODOT_RELEASE_KEYSTORE_USER
-GODOT_RELEASE_KEYSTORE_PASSWORD
-```
-
-Alternatif jika fail keystore memang tersedia pada runner/projek:
-
-```text
-GODOT_RELEASE_KEYSTORE_PATH
-GODOT_RELEASE_KEYSTORE_USER
-GODOT_RELEASE_KEYSTORE_PASSWORD
-```
-
-`GODOT_RELEASE_KEYSTORE_PATH` menerima absolute path, project-relative path atau `res://...`.
-
-Untuk Godot 4, nilai ini dipetakan kepada environment signing rasmi Godot. Untuk Godot 3, builder menyuntik nilai signing ke `export_presets.cfg` hanya semasa eksport kerana exporter Godot 3 membaca nilai release keystore terus daripada preset. Kandungan asal preset dipulihkan selepas build. Fail keystore yang dibina daripada Base64 juga dipadam selepas build.
+Release keystore environment seperti `GODOT_RELEASE_KEYSTORE_*` tidak diperlukan untuk V5 Direct Runner.
 
 ## Android toolchain
 
@@ -84,9 +80,10 @@ Builder tidak cuba mengkompilasi source C/C++ arbitrary menjadi GDExtension/GDNa
 - Prerelease/dev/RC Godot tidak dipilih secara automatik; resolver memilih stable release untuk reproducibility.
 - Godot 4.0/4.1 C# Android ditolak dengan mesej jelas kerana sokongan upstream bermula pada 4.2.
 - C# Android pada Godot 4.2+ masih tertakluk pada limitasi upstream Godot/.NET.
+- Artifact release tidak boleh terus dihantar ke Google Play sebelum user menandatanganinya dengan upload/release key sendiri.
 
 ## Regression tests
 
-`tests/test_godot_worker.py` meliputi version/toolchain mapping, Godot Standard vs Mono/.NET, multiple preset, APK/AAB, Gradle template, debug/release mode, secure signing, Godot 3 signing bridge, pemulihan fail projek/preset, package ID fallback, native extension warning dan perbezaan CLI Godot 3 vs 4.
+`tests/test_godot_worker.py` meliputi version/toolchain mapping, Godot Standard vs Mono/.NET, multiple preset, APK/AAB, Gradle template, debug/release mode, polisi unsigned release, keystore user diabaikan, temporary signing identity dibuang, Godot 3 temporary bridge, pemulihan fail projek/preset, package ID fallback, native extension warning dan perbezaan CLI Godot 3 vs 4.
 
 GitHub Actions menjalankan suite ini sebelum worker dimulakan.

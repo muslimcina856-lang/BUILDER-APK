@@ -1,5 +1,5 @@
 import asyncio
-import base64
+import copy
 import html
 import json
 import logging
@@ -361,99 +361,17 @@ def _preset_has_release_signing(section):
     return all(_extract_cfg_value(section, key).strip() for key in keys)
 
 
-def _resolve_project_file(project_dir, value):
-    value = (value or "").strip()
-    if not value:
-        return ""
-    if value.startswith("res://"):
-        return os.path.abspath(os.path.join(project_dir, *value[6:].split("/")))
-    if os.path.isabs(value):
-        return value
-    project_relative = os.path.abspath(os.path.join(project_dir, value))
-    if os.path.exists(project_relative):
-        return project_relative
-    return os.path.abspath(value)
-
-
-def _prepare_release_signing_environment(project_dir, logs):
-    """Map optional secure runner secrets to Godot's official export env vars.
-
-    The keystore can be supplied either as an existing path (including a
-    project-relative/res:// path) or as a Base64 GitHub secret so projects do
-    not need to commit signing material.
-    """
-    path_value = (
-        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH", "").strip()
-        or os.environ.get("GODOT_RELEASE_KEYSTORE_PATH", "").strip()
-    )
-    base64_value = os.environ.get("GODOT_RELEASE_KEYSTORE_BASE64", "").strip()
-    user_value = (
-        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER", "").strip()
-        or os.environ.get("GODOT_RELEASE_KEYSTORE_USER", "").strip()
-    )
-    password_value = (
-        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD", "").strip()
-        or os.environ.get("GODOT_RELEASE_KEYSTORE_PASSWORD", "").strip()
-    )
-    if not any((path_value, base64_value, user_value, password_value)):
-        return False
-    if not user_value or not password_value or not (path_value or base64_value):
-        logs.append("WARNING: Godot release signing environment tidak lengkap")
-        return False
-
-    generated = False
-    if path_value:
-        resolved_path = _resolve_project_file(project_dir, path_value)
-        if not os.path.exists(resolved_path):
-            logs.append("WARNING: Godot release keystore daripada environment tidak ditemui")
-            return False
-    else:
-        try:
-            compact = re.sub(r"\s+", "", base64_value)
-            decoded = base64.b64decode(compact, validate=True)
-        except Exception:
-            logs.append("WARNING: GODOT_RELEASE_KEYSTORE_BASE64 tidak sah")
-            return False
-        if not decoded:
-            logs.append("WARNING: GODOT_RELEASE_KEYSTORE_BASE64 kosong")
-            return False
-        fd, resolved_path = tempfile.mkstemp(
-            prefix="earlxz-godot-release-", suffix=".keystore"
-        )
-        try:
-            with os.fdopen(fd, "wb") as output:
-                output.write(decoded)
-        except Exception:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.remove(resolved_path)
-            except OSError:
-                pass
-            raise
-        os.chmod(resolved_path, stat.S_IRUSR | stat.S_IWUSR)
-        generated = True
-
-    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PATH"] = resolved_path
-    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_USER"] = user_value
-    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD"] = password_value
-    logs.append("Godot release signing configured from secure environment")
-    return {"path": resolved_path, "generated": generated}
-
-
 def _godot_cfg_quote(value):
     return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def _inject_godot3_release_signing(project_dir, selected_presets, logs):
-    """Temporarily bridge secure signing env values into Godot 3 presets.
+def _inject_godot3_temporary_release_signing(project_dir, selected_presets, logs):
+    """Bridge only the builder's throwaway identity into Godot 3 presets.
 
-    Godot 3's Android exporter reads release signing credentials directly
-    from ``export_presets.cfg``.  Modern Godot environment variables are not
-    consumed by that exporter, so CI secrets are injected only for the build
-    window and the caller restores the original bytes in ``finally``.
+    Godot 3 reads release signing credentials directly from
+    ``export_presets.cfg``. User signing values are never copied here; the
+    caller has already replaced the release environment with the temporary
+    identity used only to let the engine complete release packaging.
     """
     values = {
         "keystore/release": os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH", "").strip(),
@@ -509,7 +427,7 @@ def _inject_godot3_release_signing(project_dir, selected_presets, logs):
 
     with open(preset_path, "w", encoding="utf-8", newline="") as output:
         output.write(content)
-    logs.append("Godot 3 release signing bridged securely for this build")
+    logs.append("Godot 3 temporary signing identity injected for unsigned release export")
     return original
 
 
@@ -599,10 +517,16 @@ def _godot_export_flag(major, variant):
     raise ValueError(f"Godot export variant tidak sah: {variant}")
 
 
-def _export_variants(mode, has_release_signing):
+def _export_variants(mode, has_release_signing=None):
+    """Return variants to build. Release signing is intentionally external.
+
+    V5 Direct Runner always builds release output in ``auto`` mode regardless
+    of any user keystore. The final release artifact is rewritten as unsigned
+    so the user must sign it themselves after download.
+    """
     normalized = (mode or "auto").strip().lower()
     if normalized == "auto":
-        return ["debug", "release"] if has_release_signing else ["debug"]
+        return ["debug", "release"]
     if normalized == "debug":
         return ["debug"]
     if normalized == "release":
@@ -875,6 +799,143 @@ async def _ensure_godot_debug_keystore(logs):
         )
     logs.append("Godot debug keystore generated")
     return keystore
+
+
+async def _prepare_temporary_release_signing(logs):
+    """Create a throwaway signing identity used only to satisfy Godot export.
+
+    User/project release keystores are deliberately ignored. The generated
+    artifact is stripped back to unsigned form immediately after export, and
+    this temporary keystore is deleted in ``build_godot`` cleanup.
+    """
+    fd, keystore = tempfile.mkstemp(
+        prefix="earlxz-godot-unsigned-export-", suffix=".keystore"
+    )
+    os.close(fd)
+    try:
+        os.remove(keystore)
+    except OSError:
+        pass
+
+    user = "earlxztemporary"
+    password = "EarlxzUnsignedTemp2026"
+    command = (
+        f"keytool -genkeypair -keystore {shlex.quote(keystore)} "
+        f"-storepass {shlex.quote(password)} -alias {shlex.quote(user)} "
+        f"-keypass {shlex.quote(password)} -keyalg RSA -keysize 2048 "
+        "-validity 3650 -dname 'CN=Temporary Unsigned Export,OU=Earlxz Builder,O=Godot,C=MY'"
+    )
+    code, output, error = await run_cmd(command, timeout=60)
+    if code != 0 or not os.path.exists(keystore):
+        try:
+            os.remove(keystore)
+        except OSError:
+            pass
+        raise RuntimeError(
+            "Gagal menyediakan temporary signing identity untuk eksport Godot: "
+            + (error or output or "unknown keytool error")[-1000:]
+        )
+    os.chmod(keystore, stat.S_IRUSR | stat.S_IWUSR)
+    logs.append("Godot release export: user keystore ignored; temporary identity prepared")
+    return {"path": keystore, "user": user, "password": password}
+
+
+def _is_android_signature_entry(name):
+    normalized = (name or "").replace("\\", "/").upper()
+    if not normalized.startswith("META-INF/"):
+        return False
+    base = normalized.rsplit("/", 1)[-1]
+    return (
+        base == "MANIFEST.MF"
+        or base.startswith("SIG-")
+        or base.endswith((".SF", ".RSA", ".DSA", ".EC"))
+    )
+
+
+def _find_android_build_tool(name):
+    direct = shutil.which(name)
+    if direct:
+        return direct
+    android_home = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if not android_home:
+        return None
+    build_tools = os.path.join(android_home, "build-tools")
+    if not os.path.isdir(build_tools):
+        return None
+    versions = []
+    for entry in os.listdir(build_tools):
+        candidate = os.path.join(build_tools, entry, name)
+        if os.path.isfile(candidate):
+            versions.append((_version_tuple(entry) or (0, 0, 0), candidate))
+    return max(versions, default=(None, None), key=lambda item: item[0])[1]
+
+
+async def _make_android_artifact_unsigned(path, logs):
+    """Rebuild an APK/AAB without any APK/JAR signing material.
+
+    Rewriting the ZIP drops APK Signature Scheme v2/v3 blocks because those
+    blocks are outside normal ZIP entries. JAR/v1 signature entries under
+    META-INF are removed explicitly. APKs are zipaligned again when the
+    Android build-tools binary is available so users can sign them directly.
+    """
+    source_path = os.path.abspath(path)
+    stem, ext = os.path.splitext(source_path)
+    ext = ext.lower()
+    if ext not in (".apk", ".aab"):
+        raise RuntimeError(f"Format release Android tidak disokong untuk unsigned: {ext}")
+    unsigned_path = stem + "-unsigned" + ext
+    temp_path = unsigned_path + ".tmp"
+
+    try:
+        with zipfile.ZipFile(source_path, "r") as source, zipfile.ZipFile(
+            temp_path, "w", allowZip64=True
+        ) as target:
+            target.comment = source.comment
+            for info in source.infolist():
+                if _is_android_signature_entry(info.filename):
+                    continue
+                cloned = copy.copy(info)
+                data = source.read(info.filename)
+                target.writestr(cloned, data)
+        os.replace(temp_path, unsigned_path)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
+
+    try:
+        os.remove(source_path)
+    except OSError:
+        pass
+
+    if ext == ".apk":
+        zipalign = _find_android_build_tool("zipalign")
+        if zipalign:
+            aligned_path = unsigned_path + ".aligned"
+            command = (
+                f"{shlex.quote(zipalign)} -f -p 4 "
+                f"{shlex.quote(unsigned_path)} {shlex.quote(aligned_path)}"
+            )
+            code, output, error = await run_cmd(command, timeout=120)
+            if code == 0 and os.path.exists(aligned_path):
+                os.replace(aligned_path, unsigned_path)
+                logs.append("Unsigned release APK zipalign: OK")
+            else:
+                try:
+                    os.remove(aligned_path)
+                except OSError:
+                    pass
+                logs.append(
+                    "WARNING: unsigned APK dihasilkan tetapi zipalign gagal: "
+                    + (error or output or "unknown zipalign error")[-500:]
+                )
+        else:
+            logs.append("WARNING: zipalign tidak ditemui; unsigned APK dikekalkan tanpa realign")
+
+    logs.append(f"Godot unsigned release output: {os.path.basename(unsigned_path)}")
+    return unsigned_path
 
 
 async def _setup_godot_android_requirements(version, logs):
@@ -1272,7 +1333,7 @@ async def build_godot(project_dir, config):
     preset_path = os.path.join(project_dir, "export_presets.cfg")
     original_preset = None
     signing_preset_original = None
-    generated_release_keystore = None
+    temporary_release_keystore = None
     debug_env_names = (
         "GODOT_ANDROID_KEYSTORE_DEBUG_PATH",
         "GODOT_ANDROID_KEYSTORE_DEBUG_USER",
@@ -1315,9 +1376,13 @@ async def build_godot(project_dir, config):
             major,
             debug_keystore=debug_keystore,
         )
-        signing_info = _prepare_release_signing_environment(project_dir, logs)
-        if isinstance(signing_info, dict) and signing_info.get("generated"):
-            generated_release_keystore = signing_info.get("path")
+        planned_variants = _export_variants(export_mode)
+        if "release" in planned_variants:
+            signing_info = await _prepare_temporary_release_signing(logs)
+            temporary_release_keystore = signing_info["path"]
+            os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PATH"] = signing_info["path"]
+            os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_USER"] = signing_info["user"]
+            os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD"] = signing_info["password"]
 
         for warning in _validate_android_native_extensions(project_dir):
             logs.append("WARNING: " + warning)
@@ -1341,7 +1406,7 @@ async def build_godot(project_dir, config):
             raise RuntimeError("Tiada Android export preset Godot yang boleh digunakan")
 
         if major == 3:
-            signing_preset_original = _inject_godot3_release_signing(
+            signing_preset_original = _inject_godot3_temporary_release_signing(
                 project_dir, selected_presets, logs
             )
 
@@ -1371,25 +1436,10 @@ async def build_godot(project_dir, config):
                     logs,
                 )
 
-            variants = _export_variants(export_mode, preset.get("has_release_signing", False))
+            variants = list(planned_variants)
             preset_file_count_before = len(files)
 
             for variant in variants:
-                if variant == "release" and not preset.get("has_release_signing", False):
-                    details = (
-                        f"Preset '{preset['name']}' tidak mempunyai release keystore/user/password. "
-                        "Konfigurasikan signing release dalam export_presets.cfg atau environment Godot."
-                    )
-                    if len(files) > preset_file_count_before:
-                        logs.append("Godot release export skipped: release signing tidak dikonfigurasi")
-                        release_failures.append(f"[{preset['name']}] {details}")
-                        continue
-                    return {
-                        "success": False,
-                        "error": f"Godot Android release export gagal: {details}",
-                        "logs": logs,
-                    }
-
                 output_path = _godot_output_path(
                     output_dir,
                     preset,
@@ -1408,6 +1458,8 @@ async def build_godot(project_dir, config):
                 )
 
                 if success:
+                    if variant == "release":
+                        output_path = await _make_android_artifact_unsigned(output_path, logs)
                     files.append(output_path)
                     logs.append(f"Godot output: {os.path.basename(output_path)}")
                     continue
@@ -1467,9 +1519,9 @@ async def build_godot(project_dir, config):
                         output.write(original_preset)
             except OSError:
                 pass
-        if generated_release_keystore:
+        if temporary_release_keystore:
             try:
-                os.remove(generated_release_keystore)
+                os.remove(temporary_release_keystore)
             except OSError:
                 pass
 
