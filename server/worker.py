@@ -494,6 +494,81 @@ def _find_android_preset(project_dir):
     return presets[0]["name"], presets[0]["format"]
 
 
+def _set_godot_preset_output_format(project_dir, preset, major, output_format, logs):
+    """Temporarily switch one Android preset between APK and AAB output.
+
+    Returns the exact original ``export_presets.cfg`` bytes so the caller can
+    restore them immediately after the export. AAB always enables the Gradle
+    Android build path; APK keeps the preset's existing Gradle/custom-build
+    choice and changes only the export format.
+    """
+    normalized = (output_format or "").strip().lower()
+    if normalized not in ("apk", "aab"):
+        raise ValueError(f"Format eksport Godot tidak sah: {output_format}")
+
+    index = preset.get("index")
+    if index is None:
+        raise ValueError("Godot preset index tidak tersedia")
+
+    preset_path = os.path.join(project_dir, "export_presets.cfg")
+    with open(preset_path, "rb") as source:
+        original = source.read()
+
+    had_bom = original.startswith(b"\xef\xbb\xbf")
+    content = original.decode("utf-8-sig", errors="replace")
+    header = rf"(?m)^\[preset\.{int(index)}\.options\]\s*$"
+    header_match = re.search(header, content)
+    if header_match:
+        section_start = header_match.end()
+        next_header = re.search(r"(?m)^\[", content[section_start:])
+        section_end = section_start + (next_header.start() if next_header else len(content[section_start:]))
+        section = content[section_start:section_end]
+    else:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        content += f"\n[preset.{int(index)}.options]\n"
+        section_start = len(content)
+        section_end = len(content)
+        section = ""
+
+    if major <= 3:
+        format_key = "custom_build/export_format"
+        gradle_key = "custom_build/use_custom_build"
+    else:
+        format_key = "gradle_build/export_format"
+        gradle_key = "gradle_build/use_gradle_build"
+
+    values = {format_key: "1" if normalized == "aab" else "0"}
+    if normalized == "aab":
+        values[gradle_key] = "true"
+
+    updated = section
+    for key, value in values.items():
+        line = f"{key}={value}"
+        pattern = rf"(?m)^{re.escape(key)}\s*=.*$"
+        if re.search(pattern, updated):
+            updated = re.sub(pattern, lambda _m, replacement=line: replacement, updated, count=1)
+        else:
+            if updated and not updated.endswith("\n"):
+                updated += "\n"
+            updated += line + "\n"
+
+    content = content[:section_start] + updated + content[section_end:]
+    encoded = content.encode("utf-8")
+    if had_bom:
+        encoded = b"\xef\xbb\xbf" + encoded
+    with open(preset_path, "wb") as output:
+        output.write(encoded)
+
+    logs.append(f"Godot preset '{preset.get('name', 'Android')}' temporary format: {normalized.upper()}")
+    return original
+
+
+def _restore_file_bytes(path, original):
+    with open(path, "wb") as output:
+        output.write(original)
+
+
 def _godot_cli_prefix(engine, major):
     quoted_engine = shlex.quote(engine)
     if major >= 4:
@@ -1426,35 +1501,64 @@ async def build_godot(project_dir, config):
             for warning in _validate_android_plugins(project_dir, preset):
                 logs.append("WARNING: " + warning)
 
-            if preset.get("gradle"):
-                await _ensure_android_build_template(
-                    engine,
-                    project_dir,
-                    version,
-                    major,
-                    dotnet,
-                    logs,
-                )
+            # V5 policy: APK is always the normal installable artifact. Whenever
+            # release output is requested, also produce a Play Store AAB from
+            # the same preset, regardless of the preset's original format.
+            artifact_plan = []
+            for variant in planned_variants:
+                artifact_plan.append((variant, "apk"))
+            if "release" in planned_variants:
+                artifact_plan.append(("release", "aab"))
 
-            variants = list(planned_variants)
             preset_file_count_before = len(files)
+            for variant, output_format in artifact_plan:
+                if output_format == "aab":
+                    try:
+                        await _ensure_android_build_template(
+                            engine,
+                            project_dir,
+                            version,
+                            major,
+                            dotnet,
+                            logs,
+                        )
+                    except Exception as error:
+                        details = str(error) or "Gradle/AAB preparation failed"
+                        logs.append(
+                            f"Godot {version} {preset['name']} release AAB preparation: FAIL"
+                        )
+                        release_failures.append(
+                            f"[{preset['name']}] Godot Android release AAB preparation gagal\n{details}"
+                        )
+                        continue
 
-            for variant in variants:
-                output_path = _godot_output_path(
-                    output_dir,
-                    preset,
-                    variant,
-                    multiple_presets=multiple_presets,
-                )
-                export_flag = _godot_export_flag(major, variant)
-                command = (
-                    f"{_godot_cli_prefix(engine, major)} --path {shlex.quote(project_dir)} "
-                    f"{export_flag} {shlex.quote(preset['name'])} {shlex.quote(output_path)}"
-                )
-                code, output, error = await run_cmd(command, timeout=1800)
+                format_restore = None
+                try:
+                    format_restore = _set_godot_preset_output_format(
+                        project_dir, preset, major, output_format, logs
+                    )
+                    output_preset = dict(preset)
+                    output_preset["format"] = output_format
+                    output_path = _godot_output_path(
+                        output_dir,
+                        output_preset,
+                        variant,
+                        multiple_presets=multiple_presets,
+                    )
+                    export_flag = _godot_export_flag(major, variant)
+                    command = (
+                        f"{_godot_cli_prefix(engine, major)} --path {shlex.quote(project_dir)} "
+                        f"{export_flag} {shlex.quote(preset['name'])} {shlex.quote(output_path)}"
+                    )
+                    code, output, error = await run_cmd(command, timeout=1800)
+                finally:
+                    if format_restore is not None:
+                        _restore_file_bytes(preset_path, format_restore)
+
                 success = code == 0 and os.path.exists(output_path)
                 logs.append(
-                    f"Godot {version} {preset['name']} {variant} export: {'OK' if success else 'FAIL'}"
+                    f"Godot {version} {preset['name']} {variant} {output_format.upper()} export: "
+                    f"{'OK' if success else 'FAIL'}"
                 )
 
                 if success:
@@ -1465,15 +1569,16 @@ async def build_godot(project_dir, config):
                     continue
 
                 details = (error or output or "Unknown Godot export error")[-8000:]
-                if variant == "release" and len(files) > preset_file_count_before:
+                if variant == "release":
                     release_failures.append(
-                        f"[{preset['name']}] Godot Android release export gagal\n{details}"
+                        f"[{preset['name']}] Godot Android release {output_format.upper()} export gagal\n{details}"
                     )
                     continue
                 return {
                     "success": False,
                     "error": (
-                        f"Godot Android {variant} export gagal untuk preset '{preset['name']}'\n{details}"
+                        f"Godot Android {variant} {output_format.upper()} export gagal "
+                        f"untuk preset '{preset['name']}'\n{details}"
                     ),
                     "logs": logs,
                 }
@@ -2136,9 +2241,13 @@ async def main():
             release_failures = result.get("release_failures") or []
             if release_failures:
                 output_note = (
-                    "⚠️ Release build tidak lengkap/gagal. Debug APK yang berjaya tetap disertakan.\n"
-                    "Semak RELEASE_BUILD_ERROR.txt dalam ZIP untuk log release.\n"
-                    "Signing output tidak diubah oleh builder; ia kekal mengikut konfigurasi projek."
+                    "⚠️ Sebahagian output release tidak lengkap/gagal. Artifact yang berjaya tetap disertakan.\n"
+                    "Semak RELEASE_BUILD_ERROR.txt dalam ZIP untuk log release."
+                )
+            elif final_type == "godot":
+                output_note = (
+                    "ℹ️ Godot release APK/AAB dihantar dalam keadaan UNSIGNED. "
+                    "User wajib sign sendiri sebelum pengedaran/Google Play."
                 )
             else:
                 output_note = (

@@ -9,7 +9,7 @@ Builder ini menyediakan laluan eksport Android khusus untuk projek Godot tanpa m
 - Godot 4.2+ C#/.NET untuk Android menggunakan binary dan export templates .NET. Godot 4.0/4.1 C# Android tidak dipaksa kerana upstream belum menyokong eksport Android untuk C# pada versi itu.
 - APK debug.
 - APK release **unsigned**.
-- AAB release **unsigned** melalui Gradle build.
+- AAB release **unsigned** melalui Gradle build. Dalam mode `auto`, `both`, atau `release`, builder sentiasa mencuba output AAB walaupun preset asal ditetapkan kepada APK.
 - Lebih daripada satu Android export preset, termasuk pemilihan preset tertentu atau build semua preset.
 - Pemasangan Android Gradle build template secara automatik apabila preset memerlukannya, tanpa menindih `android/build` custom yang sudah berisi.
 - Debug keystore automatik untuk runner bersih.

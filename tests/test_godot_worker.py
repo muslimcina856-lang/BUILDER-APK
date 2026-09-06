@@ -352,7 +352,7 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
         setup_godot.assert_awaited_once_with(str(root), mock.ANY, dotnet=True)
         setup_dotnet.assert_awaited_once_with("4.7.2", mock.ANY)
 
-    async def test_aab_preset_requests_gradle_template(self):
+    async def test_release_always_requests_gradle_template_for_aab(self):
         preset = '''[preset.0]\nname="Play Store"\nplatform="Android"\nrunnable=true\n[preset.0.options]\ngradle_build/use_gradle_build=true\ngradle_build/export_format=1\n'''
         temp, root = self.make_project('config_version=5\nconfig/features=PackedStringArray("4.7")\n', preset)
         ensure_gradle = mock.AsyncMock()
@@ -363,9 +363,12 @@ class GodotBuildFlowTests(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
              mock.patch.object(worker, "_ensure_android_build_template", new=ensure_gradle), \
              mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=self._successful_export_cmd)):
-            result = await worker.build_godot(str(root), {"godot_export_mode": "debug"})
+            result = await worker.build_godot(str(root), {"godot_export_mode": "release"})
         self.assertTrue(result["success"])
-        self.assertEqual(Path(result["files"][0]).suffix, ".aab")
+        self.assertEqual(
+            [Path(path).name for path in result["files"]],
+            ["app-play-store-release-unsigned.apk", "app-play-store-release-unsigned.aab"],
+        )
         ensure_gradle.assert_awaited_once()
 
     async def test_godot3_release_uses_legacy_export_switch(self):
@@ -609,3 +612,74 @@ class GodotUnsignedReleasePolicyTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GodotMandatoryAabTests(unittest.IsolatedAsyncioTestCase):
+    def make_project(self, preset_text):
+        temp = tempfile.TemporaryDirectory()
+        root = Path(temp.name)
+        (root / "project.godot").write_text(
+            'config_version=5\nconfig/features=PackedStringArray("4.7")\n',
+            encoding="utf-8",
+        )
+        (root / "export_presets.cfg").write_text(preset_text, encoding="utf-8")
+        return temp, root
+
+    async def _export_cmd(self, command, cwd=None, timeout=1200):
+        import zipfile
+        args = shlex.split(command)
+        if any(flag in args for flag in ("--export-debug", "--export-release", "--export")):
+            output = Path(args[-1])
+            output.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(output, "w") as archive:
+                archive.writestr("assets/game.pck", b"game")
+                if "release" in output.name:
+                    archive.writestr("META-INF/MANIFEST.MF", b"manifest")
+                    archive.writestr("META-INF/BUILDER.SF", b"signature")
+                    archive.writestr("META-INF/BUILDER.RSA", b"signature")
+        return 0, "", ""
+
+    async def test_auto_apk_preset_also_emits_release_aab(self):
+        preset = ('[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n'
+                  '[preset.0.options]\ngradle_build/use_gradle_build=false\n'
+                  'gradle_build/export_format=0\n')
+        temp, root = self.make_project(preset)
+        temp_key = root / "builder-temp.keystore"
+        temp_key.write_bytes(b"temporary-key")
+        with temp, \
+             mock.patch.object(worker, "_setup_godot", new=mock.AsyncMock(return_value=("/fake/godot", "4.7.2", 4))), \
+             mock.patch.object(worker, "_setup_godot_android_requirements", new=mock.AsyncMock(return_value={})), \
+             mock.patch.object(worker, "_ensure_godot_debug_keystore", new=mock.AsyncMock(return_value=str(root / "debug.keystore"))), \
+             mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_ensure_android_build_template", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_prepare_temporary_release_signing", new=mock.AsyncMock(return_value={"path": str(temp_key), "user": "buildertemp", "password": "builderpass"})), \
+             mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=self._export_cmd)):
+            result = await worker.build_godot(str(root), {"godot_export_mode": "auto"})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            [Path(path).name for path in result["files"]],
+            ["app-debug.apk", "app-release-unsigned.apk", "app-release-unsigned.aab"],
+        )
+
+    async def test_auto_aab_preset_still_emits_apk_and_aab(self):
+        preset = ('[preset.0]\nname="Android"\nplatform="Android"\nrunnable=true\n'
+                  '[preset.0.options]\ngradle_build/use_gradle_build=true\n'
+                  'gradle_build/export_format=1\n')
+        temp, root = self.make_project(preset)
+        temp_key = root / "builder-temp.keystore"
+        temp_key.write_bytes(b"temporary-key")
+        with temp, \
+             mock.patch.object(worker, "_setup_godot", new=mock.AsyncMock(return_value=("/fake/godot", "4.7.2", 4))), \
+             mock.patch.object(worker, "_setup_godot_android_requirements", new=mock.AsyncMock(return_value={})), \
+             mock.patch.object(worker, "_ensure_godot_debug_keystore", new=mock.AsyncMock(return_value=str(root / "debug.keystore"))), \
+             mock.patch.object(worker, "_configure_android_paths", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_ensure_android_build_template", new=mock.AsyncMock()), \
+             mock.patch.object(worker, "_prepare_temporary_release_signing", new=mock.AsyncMock(return_value={"path": str(temp_key), "user": "buildertemp", "password": "builderpass"})), \
+             mock.patch.object(worker, "run_cmd", new=mock.AsyncMock(side_effect=self._export_cmd)):
+            result = await worker.build_godot(str(root), {"godot_export_mode": "auto"})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            [Path(path).name for path in result["files"]],
+            ["app-debug.apk", "app-release-unsigned.apk", "app-release-unsigned.aab"],
+        )
