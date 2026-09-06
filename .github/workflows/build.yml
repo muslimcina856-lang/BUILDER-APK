@@ -28,6 +28,18 @@ on:
       api_hash:
         description: 'Telethon API Hash'
         required: true
+      godot_preset:
+        description: 'Godot Android preset name (optional; runnable/first preset if empty)'
+        required: false
+        default: ''
+      godot_export_mode:
+        description: 'Godot export mode: auto, debug, release, both'
+        required: false
+        default: 'auto'
+      godot_build_all_presets:
+        description: 'Build every Android preset for Godot'
+        required: false
+        default: 'false'
 
 jobs:
   build:
@@ -44,10 +56,23 @@ jobs:
           pip install -r server/requirements.txt
           pip install telethon
 
+      - name: Setup Godot Host Dependencies
+        run: |
+          if ! command -v xvfb-run >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y xvfb
+          fi
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
+
+      - name: Run Regression Tests
+        env:
+          PYTHONPATH: server
+        run: |
+          python3 -m unittest discover -s tests -v
 
       - name: Run Build Worker
         env:
@@ -60,5 +85,12 @@ jobs:
           API_ID: ${{ github.event.inputs.api_id }}
           API_HASH: ${{ github.event.inputs.api_hash }}
           GITHUB_TOKEN: ${{ github.token }}
+          GODOT_PRESET: ${{ github.event.inputs.godot_preset }}
+          GODOT_EXPORT_MODE: ${{ github.event.inputs.godot_export_mode }}
+          GODOT_BUILD_ALL_PRESETS: ${{ github.event.inputs.godot_build_all_presets }}
+          GODOT_RELEASE_KEYSTORE_PATH: ${{ secrets.GODOT_RELEASE_KEYSTORE_PATH }}
+          GODOT_RELEASE_KEYSTORE_BASE64: ${{ secrets.GODOT_RELEASE_KEYSTORE_BASE64 }}
+          GODOT_RELEASE_KEYSTORE_USER: ${{ secrets.GODOT_RELEASE_KEYSTORE_USER }}
+          GODOT_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.GODOT_RELEASE_KEYSTORE_PASSWORD }}
         run: |
           python3 server/worker.py

@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -32,6 +33,38 @@ def _read_text(path):
             return f.read()
     except OSError:
         return ""
+
+
+def _detect_godot_project_kind(project_dir):
+    """Return ``dotnet`` for Godot C# projects, otherwise ``standard``.
+
+    Godot records ``C#`` in ``config/features`` for .NET projects.  A root
+    ``.csproj``/``.sln`` is also treated as authoritative so older Godot 3
+    projects are detected correctly without recursively mistaking an addon
+    source tree for the main project.
+    """
+    project_text = _read_text(os.path.join(project_dir, "project.godot"))
+    if re.search(r'["\x27]C#["\x27]', project_text, re.IGNORECASE):
+        return "dotnet"
+    if re.search(r"(?m)^dotnet/project/", project_text):
+        return "dotnet"
+
+    try:
+        root_files = os.listdir(project_dir)
+    except OSError:
+        root_files = []
+    if any(name.lower().endswith((".csproj", ".sln")) for name in root_files):
+        return "dotnet"
+    return "standard"
+
+
+def _safe_android_package_suffix(project_name):
+    suffix = re.sub(r"[^a-z0-9]+", "", (project_name or "").lower())[:40]
+    if not suffix:
+        return "project"
+    if not suffix[0].isalpha():
+        suffix = "app" + suffix
+    return suffix[:40]
 
 
 def _detect_version_hint(project_dir):
@@ -91,7 +124,7 @@ def _fetch_json(url):
         return json.load(response)
 
 
-def _resolve_release_sync(version_hint):
+def _resolve_release_sync(version_hint, dotnet=False):
     matches = []
     for page in range(1, 11):
         releases = _fetch_json(f"{GODOT_RELEASES_API}?per_page=100&page={page}")
@@ -123,21 +156,31 @@ def _resolve_release_sync(version_hint):
         url = str(asset.get("browser_download_url", ""))
         if not url:
             continue
-        if "export_templates.tpz" in lower and "mono" not in lower:
+        is_mono = "mono" in lower
+        if "export_templates.tpz" in lower and is_mono == bool(dotnet):
             template_candidates.append((name, url))
             continue
-        if not lower.endswith(".zip") or "mono" in lower or "linux" not in lower:
+        if not lower.endswith(".zip") or is_mono != bool(dotnet):
             continue
-        if not any(token in lower for token in ("x86_64", "x11.64", "linux.64", "headless.64", "server.64")):
+        if major == 3:
+            if not any(token in lower for token in ("x11", "linux", "headless", "server")):
+                continue
+        elif "linux" not in lower:
+            continue
+        if not any(token in lower for token in (
+            "x86_64", "x11_64", "x11.64", "linux.64", "headless.64", "server.64"
+        )):
             continue
         if any(token in lower for token in ("arm64", "arm32", "web_editor")):
             continue
         engine_candidates.append((name, url))
 
     if not engine_candidates:
-        raise RuntimeError(f"Binary Linux x86_64 Godot {normalized} tidak ditemui")
+        variant = " .NET/Mono" if dotnet else ""
+        raise RuntimeError(f"Binary Linux x86_64 Godot{variant} {normalized} tidak ditemui")
     if not template_candidates:
-        raise RuntimeError(f"Export templates Godot {normalized} tidak ditemui")
+        variant = " .NET/Mono" if dotnet else ""
+        raise RuntimeError(f"Export templates Godot{variant} {normalized} tidak ditemui")
 
     if major == 3:
         engine_candidates.sort(
@@ -160,6 +203,7 @@ def _resolve_release_sync(version_hint):
     return {
         "version": normalized,
         "major": major,
+        "dotnet": bool(dotnet),
         "engine_name": engine_candidates[0][0],
         "engine_url": engine_candidates[0][1],
         "templates_name": template_candidates[0][0],
@@ -167,8 +211,8 @@ def _resolve_release_sync(version_hint):
     }
 
 
-async def _resolve_release(version_hint):
-    return await asyncio.to_thread(_resolve_release_sync, version_hint)
+async def _resolve_release(version_hint, dotnet=False):
+    return await asyncio.to_thread(_resolve_release_sync, version_hint, dotnet)
 
 
 def _download_sync(url, destination):
@@ -190,6 +234,10 @@ def _find_engine_binary(directory):
                 continue
             if any(token in lower for token in (".pck", ".txt", ".md", "license")):
                 continue
+            if lower.endswith((
+                ".dll", ".so", ".dylib", ".pdb", ".xml", ".json", ".cs", ".deps", ".runtimeconfig"
+            )):
+                continue
             path = os.path.join(root, filename)
             candidates.append(path)
     if not candidates:
@@ -209,7 +257,11 @@ def _copy_template_contents(source, destination):
             shutil.copy2(src, dst)
 
 
-def _install_templates(extracted_dir, version):
+def _godot_template_version_key(version, dotnet=False):
+    return f"{version}.stable" + (".mono" if dotnet else "")
+
+
+def _install_templates(extracted_dir, version, dotnet=False):
     templates_dir = None
     for root, dirs, _ in os.walk(extracted_dir):
         if os.path.basename(root) == "templates":
@@ -221,7 +273,7 @@ def _install_templates(extracted_dir, version):
     if not templates_dir:
         templates_dir = extracted_dir
 
-    version_key = f"{version}.stable"
+    version_key = _godot_template_version_key(version, dotnet)
     data_home = os.path.expanduser(os.environ.get("XDG_DATA_HOME", "~/.local/share"))
     destinations = [
         os.path.join(data_home, "godot", "export_templates", version_key),
@@ -233,11 +285,12 @@ def _install_templates(extracted_dir, version):
         _copy_template_contents(templates_dir, destination)
 
 
-async def _setup_godot(project_dir, logs):
+async def _setup_godot(project_dir, logs, dotnet=False):
     version_hint = _detect_version_hint(project_dir)
     logs.append(f"Godot version hint: {version_hint}")
-    release = await _resolve_release(version_hint)
-    logs.append(f"Godot stable selected: {release['version']}")
+    release = await _resolve_release(version_hint, dotnet=dotnet)
+    variant = " .NET/Mono" if dotnet else ""
+    logs.append(f"Godot{variant} stable selected: {release['version']}")
 
     install_root = os.path.join(tempfile.gettempdir(), f"godot-{release['version']}")
     engine_archive = os.path.join(tempfile.gettempdir(), release["engine_name"])
@@ -262,19 +315,210 @@ async def _setup_godot(project_dir, logs):
         raise RuntimeError("Binary Godot tidak ditemui selepas extraction")
     os.chmod(engine, os.stat(engine).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    _install_templates(template_extract, release["version"])
-    logs.append("Godot export templates installed")
+    _install_templates(template_extract, release["version"], dotnet=dotnet)
+    logs.append(f"Godot{variant} export templates installed")
     return engine, release["version"], release["major"]
 
 
-def _find_android_preset(project_dir):
+def _extract_cfg_value(section, key):
+    pattern = rf'^{re.escape(key)}\s*=\s*["\x27](.*?)["\x27]\s*$'
+    match = re.search(pattern, section, re.MULTILINE)
+    if match:
+        return match.group(1)
+    bare = re.search(rf'^{re.escape(key)}\s*=\s*([^\r\n#;]+)', section, re.MULTILINE)
+    return bare.group(1).strip() if bare else ""
+
+
+def _cfg_bool(section, key, default=False):
+    value = _extract_cfg_value(section, key).strip().lower()
+    if value in ("true", "1", "yes", "on"):
+        return True
+    if value in ("false", "0", "no", "off"):
+        return False
+    return default
+
+
+def _preset_has_release_signing(section):
+    env_values = [
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH", "").strip(),
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER", "").strip(),
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD", "").strip(),
+    ]
+    if all(env_values):
+        return True
+
+    keys = (
+        "keystore/release",
+        "keystore/release_user",
+        "keystore/release_password",
+    )
+    return all(_extract_cfg_value(section, key).strip() for key in keys)
+
+
+def _resolve_project_file(project_dir, value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if value.startswith("res://"):
+        return os.path.abspath(os.path.join(project_dir, *value[6:].split("/")))
+    if os.path.isabs(value):
+        return value
+    project_relative = os.path.abspath(os.path.join(project_dir, value))
+    if os.path.exists(project_relative):
+        return project_relative
+    return os.path.abspath(value)
+
+
+def _prepare_release_signing_environment(project_dir, logs):
+    """Map optional secure runner secrets to Godot's official export env vars.
+
+    The keystore can be supplied either as an existing path (including a
+    project-relative/res:// path) or as a Base64 GitHub secret so projects do
+    not need to commit signing material.
+    """
+    path_value = (
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH", "").strip()
+        or os.environ.get("GODOT_RELEASE_KEYSTORE_PATH", "").strip()
+    )
+    base64_value = os.environ.get("GODOT_RELEASE_KEYSTORE_BASE64", "").strip()
+    user_value = (
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER", "").strip()
+        or os.environ.get("GODOT_RELEASE_KEYSTORE_USER", "").strip()
+    )
+    password_value = (
+        os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD", "").strip()
+        or os.environ.get("GODOT_RELEASE_KEYSTORE_PASSWORD", "").strip()
+    )
+    if not any((path_value, base64_value, user_value, password_value)):
+        return False
+    if not user_value or not password_value or not (path_value or base64_value):
+        logs.append("WARNING: Godot release signing environment tidak lengkap")
+        return False
+
+    generated = False
+    if path_value:
+        resolved_path = _resolve_project_file(project_dir, path_value)
+        if not os.path.exists(resolved_path):
+            logs.append("WARNING: Godot release keystore daripada environment tidak ditemui")
+            return False
+    else:
+        try:
+            compact = re.sub(r"\s+", "", base64_value)
+            decoded = base64.b64decode(compact, validate=True)
+        except Exception:
+            logs.append("WARNING: GODOT_RELEASE_KEYSTORE_BASE64 tidak sah")
+            return False
+        if not decoded:
+            logs.append("WARNING: GODOT_RELEASE_KEYSTORE_BASE64 kosong")
+            return False
+        fd, resolved_path = tempfile.mkstemp(
+            prefix="earlxz-godot-release-", suffix=".keystore"
+        )
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(decoded)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(resolved_path)
+            except OSError:
+                pass
+            raise
+        os.chmod(resolved_path, stat.S_IRUSR | stat.S_IWUSR)
+        generated = True
+
+    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PATH"] = resolved_path
+    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_USER"] = user_value
+    os.environ["GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD"] = password_value
+    logs.append("Godot release signing configured from secure environment")
+    return {"path": resolved_path, "generated": generated}
+
+
+def _godot_cfg_quote(value):
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _inject_godot3_release_signing(project_dir, selected_presets, logs):
+    """Temporarily bridge secure signing env values into Godot 3 presets.
+
+    Godot 3's Android exporter reads release signing credentials directly
+    from ``export_presets.cfg``.  Modern Godot environment variables are not
+    consumed by that exporter, so CI secrets are injected only for the build
+    window and the caller restores the original bytes in ``finally``.
+    """
+    values = {
+        "keystore/release": os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PATH", "").strip(),
+        "keystore/release_user": os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_USER", "").strip(),
+        "keystore/release_password": os.environ.get("GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD", "").strip(),
+    }
+    if not all(values.values()):
+        return None
+
+    preset_path = os.path.join(project_dir, "export_presets.cfg")
+    try:
+        with open(preset_path, "rb") as source:
+            original = source.read()
+        content = original.decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    changed = False
+    for preset in selected_presets:
+        index = preset.get("index")
+        if index is None:
+            continue
+        header = rf"(?m)^\[preset\.{int(index)}\.options\]\s*$"
+        header_match = re.search(header, content)
+        if header_match:
+            section_start = header_match.end()
+            next_header = re.search(r"(?m)^\[", content[section_start:])
+            section_end = section_start + (next_header.start() if next_header else len(content[section_start:]))
+            section = content[section_start:section_end]
+        else:
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += f"\n[preset.{int(index)}.options]\n"
+            section_start = len(content)
+            section_end = len(content)
+            section = ""
+
+        updated = section
+        for key, value in values.items():
+            line = f"{key}={_godot_cfg_quote(value)}"
+            pattern = rf"(?m)^{re.escape(key)}\s*=.*$"
+            if re.search(pattern, updated):
+                updated = re.sub(pattern, lambda _m, replacement=line: replacement, updated, count=1)
+            else:
+                if updated and not updated.endswith("\n"):
+                    updated += "\n"
+                updated += line + "\n"
+        content = content[:section_start] + updated + content[section_end:]
+        changed = True
+
+    if not changed:
+        return None
+
+    with open(preset_path, "w", encoding="utf-8", newline="") as output:
+        output.write(content)
+    logs.append("Godot 3 release signing bridged securely for this build")
+    return original
+
+
+def _list_android_presets(project_dir):
     path = os.path.join(project_dir, "export_presets.cfg")
-    content = _read_text(path)
+    content = _read_text(path).lstrip("\ufeff")
     if not content:
-        return None, "apk"
+        return []
 
     sections = re.split(r"(?=^\[preset\.\d+\]\s*$)", content, flags=re.MULTILINE)
+    presets = []
     for section in sections:
+        index_match = re.search(r'^\[preset\.(\d+)\]\s*$', section, re.MULTILINE)
+        if not index_match:
+            continue
         if not re.search(r'^platform\s*=\s*["\x27]Android["\x27]\s*$', section, re.MULTILINE):
             continue
         name_match = re.search(r'^name\s*=\s*["\x27](.*?)["\x27]\s*$', section, re.MULTILINE)
@@ -283,14 +527,96 @@ def _find_android_preset(project_dir):
         export_format = "aab" if re.search(
             r'^(?:gradle_build|custom_build)/export_format\s*=\s*1\s*$', section, re.MULTILINE
         ) else "apk"
-        return name_match.group(1), export_format
-    return None, "apk"
+        gradle_enabled = bool(re.search(
+            r'^(?:gradle_build/use_gradle_build|custom_build/use_custom_build)\s*=\s*true\s*$',
+            section,
+            re.MULTILINE | re.IGNORECASE,
+        ))
+        presets.append({
+            "index": int(index_match.group(1)),
+            "name": name_match.group(1),
+            "format": export_format,
+            "runnable": _cfg_bool(section, "runnable", False),
+            "gradle": gradle_enabled or export_format == "aab",
+            "has_release_signing": _preset_has_release_signing(section),
+            "section": section,
+        })
+    return presets
+
+
+def _select_android_presets(presets, requested=None, build_all=False):
+    if not presets:
+        return []
+    requested = (requested or "").strip()
+    if requested:
+        exact = [preset for preset in presets if preset["name"] == requested]
+        if not exact:
+            exact = [preset for preset in presets if preset["name"].lower() == requested.lower()]
+        if not exact:
+            available = ", ".join(preset["name"] for preset in presets)
+            raise ValueError(f"Godot Android preset '{requested}' tidak ditemui. Tersedia: {available}")
+        return exact
+    if build_all:
+        return list(presets)
+    runnable = [preset for preset in presets if preset.get("runnable")]
+    return [runnable[0] if runnable else presets[0]]
+
+
+def _find_android_preset(project_dir):
+    """Compatibility wrapper for callers/tests that expect the old API."""
+    presets = _list_android_presets(project_dir)
+    if not presets:
+        return None, "apk"
+    return presets[0]["name"], presets[0]["format"]
+
+
+def _godot_cli_prefix(engine, major):
+    quoted_engine = shlex.quote(engine)
+    if major >= 4:
+        return f"{quoted_engine} --headless"
+
+    binary_name = os.path.basename(engine).lower()
+    if "server" in binary_name or "headless" in binary_name:
+        return quoted_engine
+
+    xvfb = shutil.which("xvfb-run")
+    if xvfb:
+        return f"{shlex.quote(xvfb)} -a {quoted_engine}"
+    return quoted_engine
+
+
+def _godot_export_flag(major, variant):
+    if variant == "debug":
+        return "--export-debug"
+    if variant == "release":
+        return "--export" if major <= 3 else "--export-release"
+    raise ValueError(f"Godot export variant tidak sah: {variant}")
+
+
+def _export_variants(mode, has_release_signing):
+    normalized = (mode or "auto").strip().lower()
+    if normalized == "auto":
+        return ["debug", "release"] if has_release_signing else ["debug"]
+    if normalized == "debug":
+        return ["debug"]
+    if normalized == "release":
+        return ["release"]
+    if normalized == "both":
+        return ["debug", "release"]
+    raise ValueError("GODOT_EXPORT_MODE mesti auto, debug, release atau both")
+
+
+def _env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _write_fallback_preset(project_dir, major):
     path = os.path.join(project_dir, "export_presets.cfg")
     project_name = os.path.basename(os.path.abspath(project_dir)) or "project"
-    package_suffix = re.sub(r"[^a-z0-9]+", "", project_name.lower())[:40] or "project"
+    package_suffix = _safe_android_package_suffix(project_name)
 
     if major == 3:
         content = f'''[preset.0]
@@ -358,9 +684,17 @@ architectures/x86_64=false
 
 def _godot_android_profile(version):
     parsed = _version_tuple(version) or (4, 0, 0)
-    major, minor, _ = parsed
+    major, minor, patch = parsed
 
     if major <= 3:
+        if minor <= 2:
+            return {
+                "java": "8",
+                "compile_sdk": "30",
+                "build_tools": "30.0.3",
+                "cmake": "3.10.2.4988404",
+                "ndk": "21.4.7075529",
+            }
         if minor <= 5:
             return {
                 "java": "11",
@@ -368,6 +702,14 @@ def _godot_android_profile(version):
                 "build_tools": "30.0.3",
                 "cmake": "3.10.2.4988404",
                 "ndk": "21.4.7075529",
+            }
+        if minor == 6 and patch >= 2:
+            return {
+                "java": "17",
+                "compile_sdk": "35",
+                "build_tools": "35.0.1",
+                "cmake": "3.10.2.4988404",
+                "ndk": "28.1.13356709",
             }
         return {
             "java": "17",
@@ -401,13 +743,29 @@ def _godot_android_profile(version):
             "cmake": "3.10.2.4988404",
             "ndk": "23.2.8568313",
         }
+    if minor <= 7:
+        return {
+            "java": "17",
+            "compile_sdk": "35",
+            "build_tools": "35.0.0" if minor == 5 else "35.0.1",
+            "cmake": "3.10.2.4988404",
+            "ndk": "28.1.13356709",
+        }
     return {
         "java": "17",
-        "compile_sdk": "35",
-        "build_tools": "35.0.0" if minor == 5 else "35.0.1",
-        "cmake": "3.10.2.4988404",
-        "ndk": "28.1.13356709",
+        "compile_sdk": "36",
+        "build_tools": "36.1.0",
+        "cmake": "3.22.1",
+        "ndk": "29.0.14206865",
     }
+
+
+def _godot_dotnet_sdk_major(version):
+    parsed = _version_tuple(version) or (4, 0, 0)
+    major, minor, _ = parsed
+    if major >= 4 and minor >= 5:
+        return 9
+    return 8
 
 
 def _find_sdkmanager():
@@ -431,6 +789,86 @@ async def _active_java_major():
     if major == 1 and match.group(2):
         major = int(match.group(2))
     return major
+
+
+async def _active_dotnet_major():
+    code, output, error = await run_cmd("dotnet --version", timeout=60)
+    if code != 0:
+        return None
+    match = re.match(r"\s*(\d+)", output or error or "")
+    return int(match.group(1)) if match else None
+
+
+async def _setup_dotnet_sdk(version, logs):
+    required = _godot_dotnet_sdk_major(version)
+    current = await _active_dotnet_major()
+    if current is not None and current >= required:
+        logs.append(f".NET SDK {current} ready for Godot {version}")
+        os.environ.setdefault("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+        os.environ.setdefault("DOTNET_NOLOGO", "1")
+        os.environ.setdefault("NUGET_XMLDOC_MODE", "skip")
+        return current
+
+    install_dir = os.path.join(tempfile.gettempdir(), f"earlxz-dotnet-{required}")
+    dotnet_bin = os.path.join(install_dir, "dotnet")
+    if not os.path.exists(dotnet_bin):
+        script_path = os.path.join(tempfile.gettempdir(), "earlxz-dotnet-install.sh")
+        if not os.path.exists(script_path):
+            await _download("https://dot.net/v1/dotnet-install.sh", script_path)
+            os.chmod(script_path, os.stat(script_path).st_mode | stat.S_IXUSR)
+        os.makedirs(install_dir, exist_ok=True)
+        command = (
+            f"bash {shlex.quote(script_path)} --channel {required}.0 "
+            f"--install-dir {shlex.quote(install_dir)} --no-path"
+        )
+        code, output, error = await run_cmd(command, timeout=900)
+        if code != 0 or not os.path.exists(dotnet_bin):
+            raise RuntimeError(
+                f"Gagal memasang .NET SDK {required}: "
+                + (error or output or "unknown dotnet-install error")[-2000:]
+            )
+
+    os.environ["DOTNET_ROOT"] = install_dir
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if install_dir not in path_entries:
+        os.environ["PATH"] = install_dir + os.pathsep + os.environ.get("PATH", "")
+    os.environ.setdefault("DOTNET_CLI_TELEMETRY_OPTOUT", "1")
+    os.environ.setdefault("DOTNET_NOLOGO", "1")
+    os.environ.setdefault("NUGET_XMLDOC_MODE", "skip")
+
+    current = await _active_dotnet_major()
+    if current is None or current < required:
+        raise RuntimeError(
+            f"Godot {version} memerlukan .NET SDK {required}+, tetapi SDK aktif tidak sah"
+        )
+    logs.append(f".NET SDK {current} ready for Godot {version}")
+    return current
+
+
+async def _ensure_godot_debug_keystore(logs):
+    configured = os.environ.get("GODOT_ANDROID_KEYSTORE_DEBUG_PATH", "").strip()
+    if configured and os.path.exists(configured):
+        logs.append("Godot debug keystore: menggunakan konfigurasi environment")
+        return configured
+
+    keystore = os.path.join(tempfile.gettempdir(), "earlxz-godot-debug.keystore")
+    if os.path.exists(keystore):
+        return keystore
+
+    command = (
+        f"keytool -genkeypair -keystore {shlex.quote(keystore)} "
+        "-storepass android -alias androiddebugkey -keypass android "
+        "-keyalg RSA -keysize 2048 -validity 10000 "
+        "-dname 'CN=Godot Debug,OU=Earlxz Builder,O=Godot,C=MY'"
+    )
+    code, output, error = await run_cmd(command, timeout=60)
+    if code != 0 or not os.path.exists(keystore):
+        raise RuntimeError(
+            "Gagal menjana Godot debug keystore: "
+            + (error or output or "unknown keytool error")[-1000:]
+        )
+    logs.append("Godot debug keystore generated")
+    return keystore
 
 
 async def _setup_godot_android_requirements(version, logs):
@@ -506,7 +944,136 @@ async def _setup_godot_android_requirements(version, logs):
     return profile
 
 
-async def _configure_android_paths(engine, project_dir, logs, major):
+def _android_build_template_present(project_dir):
+    build_dir = os.path.join(project_dir, "android", "build")
+    if not os.path.isdir(build_dir):
+        return False
+    markers = (
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "gradlew",
+    )
+    return any(os.path.exists(os.path.join(build_dir, marker)) for marker in markers)
+
+
+def _find_android_source_template(version, dotnet=False):
+    data_home = os.path.expanduser(os.environ.get("XDG_DATA_HOME", "~/.local/share"))
+    version_keys = [_godot_template_version_key(version, dotnet)]
+    if dotnet:
+        # Some Godot releases share android_source.zip with standard templates.
+        version_keys.append(_godot_template_version_key(version, False))
+    for version_key in version_keys:
+        for base in ("export_templates", "templates"):
+            candidate = os.path.join(data_home, "godot", base, version_key, "android_source.zip")
+            if os.path.exists(candidate):
+                return candidate
+    return None
+
+
+async def _ensure_android_build_template(engine, project_dir, version, major, dotnet, logs):
+    if _android_build_template_present(project_dir):
+        logs.append("Godot Android Gradle build template already present")
+        return
+
+    build_dir = os.path.join(project_dir, "android", "build")
+    if os.path.isdir(build_dir) and os.listdir(build_dir):
+        raise RuntimeError(
+            "Folder android/build wujud tetapi tidak kelihatan seperti Godot Gradle template; "
+            "builder tidak akan menindih fail custom"
+        )
+
+    if major >= 4:
+        command = (
+            f"{shlex.quote(engine)} --headless --path {shlex.quote(project_dir)} "
+            "--install-android-build-template --quit"
+        )
+        code, output, error = await run_cmd(command, timeout=300)
+        if code == 0 and _android_build_template_present(project_dir):
+            logs.append("Godot Android Gradle build template installed by engine")
+            return
+        logs.append(
+            "Godot CLI build-template install tidak lengkap; mencuba android_source.zip fallback"
+        )
+
+    source = _find_android_source_template(version, dotnet=dotnet)
+    if not source:
+        raise RuntimeError(
+            "android_source.zip tidak ditemui dalam export templates; Gradle/AAB tidak dapat disediakan"
+        )
+
+    os.makedirs(build_dir, exist_ok=True)
+    with zipfile.ZipFile(source, "r") as archive:
+        archive.extractall(build_dir)
+    marker_dir = os.path.dirname(build_dir)
+    with open(os.path.join(marker_dir, ".build_version"), "w", encoding="utf-8") as marker:
+        marker.write(_godot_template_version_key(version, dotnet) + "\n")
+    if not _android_build_template_present(project_dir):
+        raise RuntimeError("Godot Gradle template diekstrak tetapi struktur android/build tidak sah")
+    logs.append("Godot Android Gradle build template installed from android_source.zip")
+
+
+def _validate_android_native_extensions(project_dir):
+    warnings = []
+    ignored = {".git", ".godot", ".mono", "godot_build", "build"}
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in ignored]
+        for filename in files:
+            lower = filename.lower()
+            if not lower.endswith((".gdextension", ".gdnlib")):
+                continue
+            path = os.path.join(root, filename)
+            content = _read_text(path)
+            if not content:
+                continue
+            library_lines = []
+            in_libraries = False
+            for line in content.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_libraries = stripped.lower() in ("[libraries]", "[entry]")
+                    continue
+                if in_libraries and "=" in stripped and not stripped.startswith(("#", ";")):
+                    library_lines.append(stripped)
+
+            android_lines = [line for line in library_lines if "android" in line.split("=", 1)[0].lower()]
+            relative = os.path.relpath(path, project_dir)
+            if not android_lines:
+                warnings.append(
+                    f"Native extension {relative} tidak mengisytiharkan library Android; eksport mungkin gagal"
+                )
+                continue
+            for line in android_lines:
+                value_match = re.search(r'["\x27](res://.*?)["\x27]', line)
+                if not value_match:
+                    continue
+                resource = value_match.group(1)[6:]
+                resource_path = os.path.join(project_dir, *resource.split("/"))
+                if not os.path.exists(resource_path):
+                    warnings.append(
+                        f"Native extension {relative}: library Android hilang ({value_match.group(1)})"
+                    )
+    return warnings
+
+
+def _validate_android_plugins(project_dir, preset):
+    plugin_artifacts = []
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [name for name in dirs if name not in {".git", ".godot", "godot_build", "build"}]
+        for filename in files:
+            if filename.lower().endswith((".aar", ".gdap")):
+                plugin_artifacts.append(os.path.relpath(os.path.join(root, filename), project_dir))
+    if plugin_artifacts and not preset.get("gradle"):
+        sample = ", ".join(plugin_artifacts[:3])
+        return [
+            "Android plugin ditemui tetapi preset tidak mengaktifkan Gradle build "
+            f"({sample}). Plugin Android moden memerlukan Gradle."
+        ]
+    return []
+
+
+async def _configure_android_paths(engine, project_dir, logs, major, debug_keystore=None):
     project_file = os.path.join(project_dir, "project.godot")
     if not os.path.exists(project_file):
         raise RuntimeError("project.godot tidak ditemui semasa konfigurasi Android Godot")
@@ -560,6 +1127,11 @@ func _enter_tree():
         settings.set("export/android/android_sdk_path", android_home)
     if java_home != "":
         settings.set("export/android/java_sdk_path", java_home)
+    var debug_keystore = OS.get_environment("EARLXZ_GODOT_DEBUG_KEYSTORE")
+    if debug_keystore != "":
+        settings.set("export/android/debug_keystore", debug_keystore)
+        settings.set("export/android/debug_keystore_user", "androiddebugkey")
+        settings.set("export/android/debug_keystore_pass", "android")
     var sentinel_path = OS.get_environment("EARLXZ_GODOT_SETUP_SENTINEL")
     if sentinel_path != "":
         var file = File.new()
@@ -580,6 +1152,11 @@ func _enter_tree():
         settings.set_setting("export/android/android_sdk_path", android_home)
     if java_home != "":
         settings.set_setting("export/android/java_sdk_path", java_home)
+    var debug_keystore = OS.get_environment("EARLXZ_GODOT_DEBUG_KEYSTORE")
+    if debug_keystore != "":
+        settings.set_setting("export/android/debug_keystore", debug_keystore)
+        settings.set_setting("export/android/debug_keystore_user", "androiddebugkey")
+        settings.set_setting("export/android/debug_keystore_pass", "android")
     var sentinel_path = OS.get_environment("EARLXZ_GODOT_SETUP_SENTINEL")
     if sentinel_path != "":
         var file = FileAccess.open(sentinel_path, FileAccess.WRITE)
@@ -593,6 +1170,8 @@ func _enter_tree():
     managed_env = {
         "EARLXZ_GODOT_SETUP_SENTINEL": sentinel_path,
     }
+    if debug_keystore:
+        managed_env["EARLXZ_GODOT_DEBUG_KEYSTORE"] = debug_keystore
     previous_env = {name: os.environ.get(name) for name in managed_env}
 
     try:
@@ -605,9 +1184,8 @@ func _enter_tree():
             output.write(configured_project)
 
         os.environ.update(managed_env)
-        display_flag = "--no-window" if major == 3 else "--headless"
         command = (
-            f"{shlex.quote(engine)} {display_flag} --editor "
+            f"{_godot_cli_prefix(engine, major)} --editor "
             f"--path {shlex.quote(project_dir)}"
         )
         code, output, error = await run_cmd(command, timeout=180)
@@ -643,70 +1221,249 @@ func _enter_tree():
             else:
                 os.environ[name] = previous_value
 
+def _godot_output_slug(name):
+    slug = re.sub(r"[^a-z0-9]+", "-", (name or "android").lower()).strip("-")
+    return slug[:48] or "android"
+
+
+def _godot_output_path(output_dir, preset, variant, multiple_presets=False):
+    preset_slug = _godot_output_slug(preset["name"])
+    prefix = f"app-{preset_slug}" if multiple_presets or preset_slug != "android" else "app"
+    return os.path.abspath(os.path.join(output_dir, f"{prefix}-{variant}.{preset['format']}"))
+
+
+def _root_csproj_files(project_dir):
+    try:
+        return sorted(
+            os.path.join(project_dir, name)
+            for name in os.listdir(project_dir)
+            if name.lower().endswith(".csproj")
+        )
+    except OSError:
+        return []
+
+
 async def build_godot(project_dir, config):
     logs = []
     if not os.path.exists(os.path.join(project_dir, "project.godot")):
         return {"success": False, "error": "project.godot tidak ditemui", "logs": logs}
 
-    if any(filename.lower().endswith(".csproj") for filename in os.listdir(project_dir)):
-        return {
-            "success": False,
-            "error": "Godot C# / Mono belum disokong oleh runner ini. Gunakan projek Godot GDScript.",
-            "logs": logs,
-        }
+    project_kind = _detect_godot_project_kind(project_dir)
+    dotnet = project_kind == "dotnet"
+    logs.append(f"Godot project kind: {project_kind}")
+
+    requested_preset = (config.get("godot_preset") or os.environ.get("GODOT_PRESET", "")).strip()
+    export_mode = (config.get("godot_export_mode") or os.environ.get("GODOT_EXPORT_MODE", "auto")).strip().lower()
+    build_all_value = config.get("godot_build_all_presets")
+    if build_all_value is None:
+        build_all_presets = _env_bool("GODOT_BUILD_ALL_PRESETS", False)
+    elif isinstance(build_all_value, str):
+        build_all_presets = build_all_value.strip().lower() in ("1", "true", "yes", "on")
+    else:
+        build_all_presets = bool(build_all_value)
 
     created_preset = False
     preset_path = os.path.join(project_dir, "export_presets.cfg")
     original_preset = None
+    signing_preset_original = None
+    generated_release_keystore = None
+    debug_env_names = (
+        "GODOT_ANDROID_KEYSTORE_DEBUG_PATH",
+        "GODOT_ANDROID_KEYSTORE_DEBUG_USER",
+        "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD",
+    )
+    release_env_names = (
+        "GODOT_ANDROID_KEYSTORE_RELEASE_PATH",
+        "GODOT_ANDROID_KEYSTORE_RELEASE_USER",
+        "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD",
+    )
+    previous_debug_env = {name: os.environ.get(name) for name in debug_env_names}
+    previous_release_env = {name: os.environ.get(name) for name in release_env_names}
 
     try:
-        engine, version, major = await _setup_godot(project_dir, logs)
-        await _setup_godot_android_requirements(version, logs)
-        await _configure_android_paths(engine, project_dir, logs, major)
+        engine, version, major = await _setup_godot(project_dir, logs, dotnet=dotnet)
+        parsed_version = _version_tuple(version) or (major, 0, 0)
 
-        preset_name, output_format = _find_android_preset(project_dir)
-        if not preset_name:
+        if dotnet:
+            if major == 4 and parsed_version[1] < 2:
+                raise RuntimeError(
+                    f"Godot {version} C# tidak menyokong eksport Android; gunakan Godot 4.2+ atau Godot 3.x Mono"
+                )
+            csproj_files = _root_csproj_files(project_dir)
+            if not csproj_files:
+                raise RuntimeError(
+                    "Projek Godot C# dikesan tetapi fail .csproj di root projek tidak ditemui. "
+                    "Sertakan fail .csproj/.sln dalam ZIP."
+                )
+            await _setup_dotnet_sdk(version, logs)
+
+        await _setup_godot_android_requirements(version, logs)
+        debug_keystore = await _ensure_godot_debug_keystore(logs)
+        os.environ["GODOT_ANDROID_KEYSTORE_DEBUG_PATH"] = debug_keystore
+        os.environ["GODOT_ANDROID_KEYSTORE_DEBUG_USER"] = "androiddebugkey"
+        os.environ["GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD"] = "android"
+        await _configure_android_paths(
+            engine,
+            project_dir,
+            logs,
+            major,
+            debug_keystore=debug_keystore,
+        )
+        signing_info = _prepare_release_signing_environment(project_dir, logs)
+        if isinstance(signing_info, dict) and signing_info.get("generated"):
+            generated_release_keystore = signing_info.get("path")
+
+        for warning in _validate_android_native_extensions(project_dir):
+            logs.append("WARNING: " + warning)
+
+        presets = _list_android_presets(project_dir)
+        if not presets:
             if os.path.exists(preset_path):
-                original_preset = _read_text(preset_path)
+                with open(preset_path, "rb") as source:
+                    original_preset = source.read()
             _write_fallback_preset(project_dir, major)
-            preset_name = "Android"
-            output_format = "apk"
             created_preset = True
             logs.append("Android export preset generated temporarily")
+            presets = _list_android_presets(project_dir)
+
+        selected_presets = _select_android_presets(
+            presets,
+            requested=requested_preset,
+            build_all=build_all_presets,
+        )
+        if not selected_presets:
+            raise RuntimeError("Tiada Android export preset Godot yang boleh digunakan")
+
+        if major == 3:
+            signing_preset_original = _inject_godot3_release_signing(
+                project_dir, selected_presets, logs
+            )
+
+        logs.append(
+            "Godot Android preset selected: "
+            + ", ".join(preset["name"] for preset in selected_presets)
+        )
+        logs.append(f"Godot export mode: {export_mode}")
 
         output_dir = os.path.join(project_dir, "godot_build")
         os.makedirs(output_dir, exist_ok=True)
-        output_path = os.path.abspath(os.path.join(output_dir, f"app-debug.{output_format}"))
+        files = []
+        release_failures = []
+        multiple_presets = len(selected_presets) > 1
 
-        display_flag = "--no-window" if major == 3 else "--headless"
-        command = (
-            f"{shlex.quote(engine)} {display_flag} --path {shlex.quote(project_dir)} "
-            f"--export-debug {shlex.quote(preset_name)} {shlex.quote(output_path)}"
-        )
-        code, output, error = await run_cmd(command, timeout=1800)
-        logs.append(f"Godot {major} debug export: {'OK' if code == 0 else 'FAIL'}")
+        for preset in selected_presets:
+            for warning in _validate_android_plugins(project_dir, preset):
+                logs.append("WARNING: " + warning)
 
-        if code != 0 or not os.path.exists(output_path):
-            details = (error or output or "Unknown Godot export error")[-8000:]
+            if preset.get("gradle"):
+                await _ensure_android_build_template(
+                    engine,
+                    project_dir,
+                    version,
+                    major,
+                    dotnet,
+                    logs,
+                )
+
+            variants = _export_variants(export_mode, preset.get("has_release_signing", False))
+            preset_file_count_before = len(files)
+
+            for variant in variants:
+                if variant == "release" and not preset.get("has_release_signing", False):
+                    details = (
+                        f"Preset '{preset['name']}' tidak mempunyai release keystore/user/password. "
+                        "Konfigurasikan signing release dalam export_presets.cfg atau environment Godot."
+                    )
+                    if len(files) > preset_file_count_before:
+                        logs.append("Godot release export skipped: release signing tidak dikonfigurasi")
+                        release_failures.append(f"[{preset['name']}] {details}")
+                        continue
+                    return {
+                        "success": False,
+                        "error": f"Godot Android release export gagal: {details}",
+                        "logs": logs,
+                    }
+
+                output_path = _godot_output_path(
+                    output_dir,
+                    preset,
+                    variant,
+                    multiple_presets=multiple_presets,
+                )
+                export_flag = _godot_export_flag(major, variant)
+                command = (
+                    f"{_godot_cli_prefix(engine, major)} --path {shlex.quote(project_dir)} "
+                    f"{export_flag} {shlex.quote(preset['name'])} {shlex.quote(output_path)}"
+                )
+                code, output, error = await run_cmd(command, timeout=1800)
+                success = code == 0 and os.path.exists(output_path)
+                logs.append(
+                    f"Godot {version} {preset['name']} {variant} export: {'OK' if success else 'FAIL'}"
+                )
+
+                if success:
+                    files.append(output_path)
+                    logs.append(f"Godot output: {os.path.basename(output_path)}")
+                    continue
+
+                details = (error or output or "Unknown Godot export error")[-8000:]
+                if variant == "release" and len(files) > preset_file_count_before:
+                    release_failures.append(
+                        f"[{preset['name']}] Godot Android release export gagal\n{details}"
+                    )
+                    continue
+                return {
+                    "success": False,
+                    "error": (
+                        f"Godot Android {variant} export gagal untuk preset '{preset['name']}'\n{details}"
+                    ),
+                    "logs": logs,
+                }
+
+        if not files:
             return {
                 "success": False,
-                "error": f"Godot Android debug export gagal\n{details}",
+                "error": "Godot export tamat tanpa menghasilkan APK/AAB",
                 "logs": logs,
             }
-
-        logs.append(f"Godot {version} debug output: {os.path.basename(output_path)}")
-        return {"success": True, "files": [output_path], "logs": logs}
+        return {
+            "success": True,
+            "files": files,
+            "logs": logs,
+            "release_failures": release_failures,
+        }
     except Exception as error:
         logger.exception("Godot build setup failed")
         return {"success": False, "error": f"Godot build gagal: {error}", "logs": logs}
     finally:
+        for name, previous_value in previous_debug_env.items():
+            if previous_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous_value
+        for name, previous_value in previous_release_env.items():
+            if previous_value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = previous_value
+        if signing_preset_original is not None:
+            try:
+                with open(preset_path, "wb") as output:
+                    output.write(signing_preset_original)
+            except OSError:
+                pass
         if created_preset:
             try:
                 if original_preset is None:
                     os.remove(preset_path)
                 else:
-                    with open(preset_path, "w", encoding="utf-8") as f:
-                        f.write(original_preset)
+                    with open(preset_path, "wb") as output:
+                        output.write(original_preset)
+            except OSError:
+                pass
+        if generated_release_keystore:
+            try:
+                os.remove(generated_release_keystore)
             except OSError:
                 pass
 
