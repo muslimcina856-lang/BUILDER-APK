@@ -126,7 +126,7 @@ def _fetch_json(url):
         headers["Authorization"] = f"Bearer {_GITHUB_API_TOKEN}"
 
     request = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(request, timeout=60) as response:
+    with urllib.request.urlopen(request, timeout=None) as response:
         return json.load(response)
 
 
@@ -223,7 +223,7 @@ async def _resolve_release(version_hint, dotnet=False):
 
 def _download_sync(url, destination):
     request = urllib.request.Request(url, headers={"User-Agent": "Earlxz-BUILDER-APK-Godot"})
-    with urllib.request.urlopen(request, timeout=300) as response, open(destination, "wb") as output:
+    with urllib.request.urlopen(request, timeout=None) as response, open(destination, "wb") as output:
         shutil.copyfileobj(response, output, length=1024 * 1024)
 
 
@@ -783,7 +783,7 @@ def _find_sdkmanager():
 
 
 async def _active_java_major():
-    code, output, error = await run_cmd("java -version", timeout=60)
+    code, output, error = await run_cmd("java -version", timeout=None)
     if code != 0:
         raise RuntimeError(f"Tidak dapat mengesahkan versi Java: {(error or output)[-500:]}")
     version_text = error or output
@@ -797,7 +797,7 @@ async def _active_java_major():
 
 
 async def _active_dotnet_major():
-    code, output, error = await run_cmd("dotnet --version", timeout=60)
+    code, output, error = await run_cmd("dotnet --version", timeout=None)
     if code != 0:
         return None
     match = re.match(r"\s*(\d+)", output or error or "")
@@ -826,7 +826,7 @@ async def _setup_dotnet_sdk(version, logs):
             f"bash {shlex.quote(script_path)} --channel {required}.0 "
             f"--install-dir {shlex.quote(install_dir)} --no-path"
         )
-        code, output, error = await run_cmd(command, timeout=900)
+        code, output, error = await run_cmd(command, timeout=None)
         if code != 0 or not os.path.exists(dotnet_bin):
             raise RuntimeError(
                 f"Gagal memasang .NET SDK {required}: "
@@ -866,7 +866,7 @@ async def _ensure_godot_debug_keystore(logs):
         "-keyalg RSA -keysize 2048 -validity 10000 "
         "-dname 'CN=Godot Debug,OU=Earlxz Builder,O=Godot,C=MY'"
     )
-    code, output, error = await run_cmd(command, timeout=60)
+    code, output, error = await run_cmd(command, timeout=None)
     if code != 0 or not os.path.exists(keystore):
         raise RuntimeError(
             "Gagal menjana Godot debug keystore: "
@@ -900,7 +900,7 @@ async def _prepare_temporary_release_signing(logs):
         f"-keypass {shlex.quote(password)} -keyalg RSA -keysize 2048 "
         "-validity 3650 -dname 'CN=Temporary Unsigned Export,OU=Earlxz Builder,O=Godot,C=MY'"
     )
-    code, output, error = await run_cmd(command, timeout=60)
+    code, output, error = await run_cmd(command, timeout=None)
     if code != 0 or not os.path.exists(keystore):
         try:
             os.remove(keystore)
@@ -993,7 +993,7 @@ async def _make_android_artifact_unsigned(path, logs):
                 f"{shlex.quote(zipalign)} -f -p 4 "
                 f"{shlex.quote(unsigned_path)} {shlex.quote(aligned_path)}"
             )
-            code, output, error = await run_cmd(command, timeout=120)
+            code, output, error = await run_cmd(command, timeout=None)
             if code == 0 and os.path.exists(aligned_path):
                 os.replace(aligned_path, unsigned_path)
                 logs.append("Unsigned release APK zipalign: OK")
@@ -1046,7 +1046,7 @@ async def _setup_godot_android_requirements(version, logs):
         f"yes | {shlex.quote(sdkmanager)} --sdk_root={shlex.quote(android_home)} "
         f"{package_args}"
     )
-    code, output, error = await run_cmd(command, timeout=900)
+    code, output, error = await run_cmd(command, timeout=None)
     if code != 0:
         raise RuntimeError(
             "Gagal memasang komponen Android Godot: "
@@ -1131,7 +1131,7 @@ async def _ensure_android_build_template(engine, project_dir, version, major, do
             f"{shlex.quote(engine)} --headless --path {shlex.quote(project_dir)} "
             "--install-android-build-template --quit"
         )
-        code, output, error = await run_cmd(command, timeout=300)
+        code, output, error = await run_cmd(command, timeout=None)
         if code == 0 and _android_build_template_present(project_dir):
             logs.append("Godot Android Gradle build template installed by engine")
             return
@@ -1330,7 +1330,7 @@ func _enter_tree():
             f"{_godot_cli_prefix(engine, major)} --editor "
             f"--path {shlex.quote(project_dir)}"
         )
-        code, output, error = await run_cmd(command, timeout=180)
+        code, output, error = await run_cmd(command, timeout=None)
         if code != 0:
             raise RuntimeError(
                 "Godot gagal menyimpan tetapan Android SDK/JDK: "
@@ -1550,7 +1550,7 @@ async def build_godot(project_dir, config):
                         f"{_godot_cli_prefix(engine, major)} --path {shlex.quote(project_dir)} "
                         f"{export_flag} {shlex.quote(preset['name'])} {shlex.quote(output_path)}"
                     )
-                    code, output, error = await run_cmd(command, timeout=1800)
+                    code, output, error = await run_cmd(command, timeout=None)
                 finally:
                     if format_restore is not None:
                         _restore_file_bytes(preset_path, format_restore)
@@ -1958,7 +1958,7 @@ def find_project_directory(build_dir):
 
 
 async def download_project_link(download_url, destination):
-    timeout = aiohttp.ClientTimeout(total=600)
+    timeout = aiohttp.ClientTimeout(total=None)
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "

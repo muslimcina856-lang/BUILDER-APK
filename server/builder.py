@@ -11,18 +11,25 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
-async def run_cmd(cmd, cwd=None, timeout=1200):
+async def run_cmd(cmd, cwd=None, timeout=None):
     env = os.environ.copy()
     proc = await asyncio.create_subprocess_shell(
         cmd, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd, env=env,
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        return -1, "", "Build timeout exceeded"
+    # No builder-side time limit by default. GitHub-hosted runners still enforce
+    # their own platform job execution limit. A finite timeout remains supported
+    # only for external callers that explicitly opt into one.
+    if timeout is None:
+        stdout, stderr = await proc.communicate()
+    else:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            return -1, "", "Build timeout exceeded"
     return proc.returncode, stdout.decode(errors="replace"), stderr.decode(errors="replace")
 
 
@@ -85,7 +92,7 @@ async def setup_java(version):
         f"(sudo add-apt-repository -y ppa:openjdk-r/ppa 2>/dev/null && "
         f"sudo apt-get update -qq 2>/dev/null && "
         f"sudo apt-get install -y -qq openjdk-{version}-jdk 2>/dev/null)",
-        timeout=300,
+        timeout=None,
     )
     home = find_java_home(version)
     if home:
@@ -110,7 +117,7 @@ async def setup_java(version):
         f"curl -fsSL --retry 3 '{temurin_url}' -o /tmp/jdk-{version}.tar.gz && "
         f"tar -xzf /tmp/jdk-{version}.tar.gz -C '{install_dir}' --strip-components=1 && "
         f"rm -f /tmp/jdk-{version}.tar.gz",
-        timeout=300,
+        timeout=None,
     )
 
     if code == 0:
@@ -120,7 +127,7 @@ async def setup_java(version):
             # Register dengan update-alternatives supaya sistem kenal
             await run_cmd(
                 f"sudo update-alternatives --install /usr/bin/java java '{java_bin}' 100 2>/dev/null || true",
-                timeout=30,
+                timeout=None,
             )
             set_java_env(install_dir)
             logger.info(f"Java {version} installed via Temurin at {install_dir}")
@@ -193,7 +200,7 @@ async def setup_android_sdk(compile_sdk=None, build_tools=None):
     if build_tools:
         cmds.append(f'echo "y" | {sm} "build-tools;{build_tools}"')
     for c in cmds:
-        await run_cmd(c, timeout=300)
+        await run_cmd(c, timeout=None)
 
 
 async def setup_flutter(version):
@@ -203,14 +210,14 @@ async def setup_flutter(version):
     branch = "stable" if (version == "stable" or not re.match(r"\d+\.\d+\.\d+", version)) else version
     code, _, err = await run_cmd(
         f"git clone https://github.com/flutter/flutter.git -b {branch} --depth 1 {fdir}",
-        timeout=300,
+        timeout=None,
     )
     if code != 0:
         logger.error(f"Flutter clone failed: {err}")
         return False
     os.environ["PATH"] = f"{fdir}/bin:{os.environ['PATH']}"
-    await run_cmd("flutter precache --android", timeout=300)
-    await run_cmd("yes | flutter doctor --android-licenses 2>/dev/null || true", timeout=120)
+    await run_cmd("flutter precache --android", timeout=None)
+    await run_cmd("yes | flutter doctor --android-licenses 2>/dev/null || true", timeout=None)
     return True
 
 
@@ -229,7 +236,7 @@ async def setup_node(version="20"):
     if not os.path.exists(nvm_dir):
         await run_cmd(
             "curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash",
-            timeout=120,
+            timeout=None,
         )
 
     code, _, _ = await run_cmd(
@@ -237,7 +244,7 @@ async def setup_node(version="20"):
         f'&& nvm install {version} && nvm use {version} && '
         f'echo "export NVM_DIR=$HOME/.nvm" >> ~/.bashrc && '
         f'echo \'[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"\' >> ~/.bashrc',
-        timeout=300,
+        timeout=None,
     )
 
     node_bin = os.path.expanduser(f"~/.nvm/versions/node/v{version}/bin")
@@ -269,14 +276,14 @@ async def _detect_package_manager(project_dir):
 async def _install_node_deps(project_dir, logs):
     pm = await _detect_package_manager(project_dir)
     if pm == "yarn":
-        code, out, err = await run_cmd("yarn install --frozen-lockfile || yarn install", cwd=project_dir, timeout=600)
+        code, out, err = await run_cmd("yarn install --frozen-lockfile || yarn install", cwd=project_dir, timeout=None)
     else:
-        code, out, err = await run_cmd("npm install --legacy-peer-deps", cwd=project_dir, timeout=600)
+        code, out, err = await run_cmd("npm install --legacy-peer-deps", cwd=project_dir, timeout=None)
 
     if code != 0:
         logs.append(f"Warning: {pm} install ada warning, cuba teruskan...")
         pm_cmd = "yarn install" if pm == "yarn" else "npm install --force"
-        code, out, err = await run_cmd(pm_cmd, cwd=project_dir, timeout=600)
+        code, out, err = await run_cmd(pm_cmd, cwd=project_dir, timeout=None)
 
     logs.append(f"{pm} install: {'OK' if code == 0 else 'FAIL'}")
     return code == 0
@@ -787,7 +794,7 @@ async def _install_ndk_version(ndk_ver, logs):
     if os.path.isdir(ndk_path):
         return True
     logs.append(f"Auto-fix: Memasang NDK {ndk_ver}...")
-    code, _, err = await run_cmd(f'echo "y" | "{sm}" "ndk;{ndk_ver}"', timeout=600)
+    code, _, err = await run_cmd(f'echo "y" | "{sm}" "ndk;{ndk_ver}"', timeout=None)
     if code == 0 and os.path.isdir(ndk_path):
         logs.append(f"Auto-fix: NDK {ndk_ver} berjaya dipasang")
         return True
@@ -1420,11 +1427,11 @@ async def fix_common_issues(project_dir, logs, gradle_subdir=""):
                 f"curl -fsSL '{gradle_dist_url}' -o /tmp/gradle-dl.zip && "
                 f"rm -rf /tmp/gradle-inst && "
                 f"unzip -qo /tmp/gradle-dl.zip -d /tmp/gradle-inst",
-                timeout=300,
+                timeout=None,
             )
         gradle_bin = os.path.join(dl_dir, "bin", "gradle")
         if os.path.exists(gradle_bin):
-            code, _, _ = await run_cmd(f"{gradle_bin} wrapper", cwd=gdir, timeout=180)
+            code, _, _ = await run_cmd(f"{gradle_bin} wrapper", cwd=gdir, timeout=None)
             if os.path.exists(gradlew):
                 await run_cmd(f"chmod +x {gradlew}")
                 logs.append(f"Auto-fix: gradle wrapper generated (v{dl_ver})")
@@ -1755,7 +1762,7 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
     if agp_required:
         logs.append(f"Auto-fix: AGP conflict — dependency perlukan AGP >= {agp_required}")
         await fix_flutter_versions(project_dir, logs, required_agp_override=agp_required)
-        await run_cmd("flutter pub get", cwd=project_dir, timeout=300)
+        await run_cmd("flutter pub get", cwd=project_dir, timeout=None)
         code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
         if code == 0:
             return code, out, err
@@ -1781,7 +1788,7 @@ async def _build_flutter_with_retry(project_dir, logs, android_dir):
         kgp_warning = _has_kgp_plugin_warning(combined)
         if jvm_mismatch or kgp_warning:
             if await _fallback_downgrade_agp_for_legacy_plugins(project_dir, android_dir, logs):
-                await run_cmd("flutter pub get", cwd=project_dir, timeout=300)
+                await run_cmd("flutter pub get", cwd=project_dir, timeout=None)
                 code, out, err = await run_cmd("flutter build apk --debug", cwd=project_dir)
                 if code == 0:
                     return code, out, err
@@ -1928,7 +1935,7 @@ async def build_flutter(project_dir, config):
     )
     if android_incomplete:
         logs.append("Auto-fix: folder android/ tiada atau tak lengkap, generate guna 'flutter create .'")
-        code0, out0, err0 = await run_cmd("flutter create .", cwd=project_dir, timeout=180)
+        code0, out0, err0 = await run_cmd("flutter create .", cwd=project_dir, timeout=None)
         if code0 != 0:
             return {"success": False, "error": f"flutter create . gagal\n{err0}\n{out0}", "logs": logs}
 
@@ -1948,7 +1955,7 @@ async def build_flutter(project_dir, config):
     if os.path.exists(gw):
         await run_cmd(f"chmod +x {gw}")
 
-    code, out, err = await run_cmd("flutter pub get", cwd=project_dir, timeout=300)
+    code, out, err = await run_cmd("flutter pub get", cwd=project_dir, timeout=None)
     logs.append(f"pub get: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"flutter pub get failed\n{err}\n{out}", "logs": logs}
@@ -2034,7 +2041,7 @@ async def _ensure_debug_keystore():
         ' -alias debug -keyalg RSA -keysize 2048 -validity 10000'
         ' -storepass android -keypass android'
         ' -dname "CN=Debug,O=Debug,C=US"',
-        timeout=30,
+        timeout=None,
     )
     return ks_path if code == 0 and os.path.exists(ks_path) else None
 
@@ -2043,7 +2050,7 @@ async def _sign_apk(apk_path, keystore, apksigner_bin, logs):
     code, _, err = await run_cmd(
         f'"{apksigner_bin}" sign --ks "{keystore}" --ks-key-alias debug'
         f' --ks-pass pass:android --key-pass pass:android "{apk_path}"',
-        timeout=120,
+        timeout=None,
     )
     if code == 0:
         logs.append(f"Signed: {os.path.basename(apk_path)}")
@@ -2097,7 +2104,7 @@ async def _package_as_apks(base_apk, splits_dir, output_path, zipalign_bin, apks
     if zipalign_bin:
         for sa in split_apks:
             aligned = sa + '.aligned'
-            code, _, _ = await run_cmd(f'"{zipalign_bin}" -p -f 4 "{sa}" "{aligned}"', timeout=60)
+            code, _, _ = await run_cmd(f'"{zipalign_bin}" -p -f 4 "{sa}" "{aligned}"', timeout=None)
             if code == 0 and os.path.exists(aligned):
                 os.replace(aligned, sa)
     if apksigner_bin and keystore:
@@ -2137,7 +2144,7 @@ async def build_smali(project_dir, config):
     if zipalign:
         for apk_path in files:
             aligned_path = apk_path + ".aligned"
-            zcode, _, zerr = await run_cmd(f'"{zipalign}" -p -f 4 "{apk_path}" "{aligned_path}"', timeout=120)
+            zcode, _, zerr = await run_cmd(f'"{zipalign}" -p -f 4 "{apk_path}" "{aligned_path}"', timeout=None)
             if zcode == 0 and os.path.exists(aligned_path):
                 os.replace(aligned_path, apk_path)
                 logs.append(f"zipalign: OK ({os.path.basename(apk_path)})")
@@ -2215,20 +2222,20 @@ async def build_cordova(project_dir, config):
     logs.append(f"Java {config.get('java_version','17')} ready")
     await setup_android_sdk()
     logs.append("Android SDK ready")
-    code, _, err = await run_cmd("npm install -g cordova", timeout=300)
+    code, _, err = await run_cmd("npm install -g cordova", timeout=None)
     logs.append(f"cordova install: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"Cordova CLI install gagal\n{err}", "logs": logs}
     await _install_node_deps(project_dir, logs)
     android_platform = os.path.join(project_dir, "platforms", "android")
     if not os.path.isdir(android_platform):
-        code, out, err = await run_cmd("cordova platform add android", cwd=project_dir, timeout=300)
+        code, out, err = await run_cmd("cordova platform add android", cwd=project_dir, timeout=None)
         logs.append(f"platform add android: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
             return {"success": False, "error": f"Gagal tambah platform android\n{err}\n{out}", "logs": logs}
     if os.path.isdir(android_platform):
         await fix_common_issues(android_platform, logs)
-    code, out, err = await run_cmd("cordova build android --debug", cwd=project_dir, timeout=900)
+    code, out, err = await run_cmd("cordova build android --debug", cwd=project_dir, timeout=None)
     logs.append(f"cordova build debug: {'OK' if code == 0 else 'FAIL'}")
     if code != 0:
         return {"success": False, "error": f"Cordova debug build gagal\n{err}\n{out}", "logs": logs}
@@ -2238,7 +2245,7 @@ async def build_cordova(project_dir, config):
     ]
     _force_unsigned_release(android_platform, logs)
     release_failures = []
-    code2, out2, err2 = await run_cmd("cordova build android --release", cwd=project_dir, timeout=900)
+    code2, out2, err2 = await run_cmd("cordova build android --release", cwd=project_dir, timeout=None)
     logs.append(f"cordova build release: {'OK' if code2 == 0 else 'FAIL'}")
     _record_release_failure(release_failures, "cordova build android --release", code2, out2, err2)
     files = _collect_apks(output_dirs)
@@ -2257,7 +2264,7 @@ async def build_ionic(project_dir, config):
     logs.append(f"Java {config.get('java_version','17')} ready")
     await setup_android_sdk()
     logs.append("Android SDK ready")
-    await run_cmd("npm install -g @ionic/cli", timeout=300)
+    await run_cmd("npm install -g @ionic/cli", timeout=None)
     logs.append("Ionic CLI ready")
     ok = await _install_node_deps(project_dir, logs)
     if not ok:
@@ -2271,18 +2278,18 @@ async def build_ionic(project_dir, config):
 
     if is_capacitor:
         logs.append("Detected: Ionic + Capacitor")
-        code, out, err = await run_cmd("ionic build --prod || ionic build", cwd=project_dir, timeout=600)
+        code, out, err = await run_cmd("ionic build --prod || ionic build", cwd=project_dir, timeout=None)
         logs.append(f"ionic build: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
-            code, out, err = await run_cmd("npx ng build --configuration production || npx ng build", cwd=project_dir, timeout=600)
+            code, out, err = await run_cmd("npx ng build --configuration production || npx ng build", cwd=project_dir, timeout=None)
             logs.append(f"ng build fallback: {'OK' if code == 0 else 'FAIL'}")
             if code != 0:
                 return {"success": False, "error": f"Web build gagal\n{err}\n{out}", "logs": logs}
-        code, out, err = await run_cmd("npx cap sync android", cwd=project_dir, timeout=300)
+        code, out, err = await run_cmd("npx cap sync android", cwd=project_dir, timeout=None)
         logs.append(f"cap sync: {'OK' if code == 0 else 'FAIL'}")
         android_dir = os.path.join(project_dir, "android")
         if not os.path.isdir(android_dir):
-            code, out, err = await run_cmd("npx cap add android", cwd=project_dir, timeout=300)
+            code, out, err = await run_cmd("npx cap add android", cwd=project_dir, timeout=None)
             logs.append(f"cap add android: {'OK' if code == 0 else 'FAIL'}")
         if os.path.isdir(android_dir):
             await fix_common_issues(android_dir, logs)
@@ -2303,17 +2310,17 @@ async def build_ionic(project_dir, config):
         search_dirs = [os.path.join(project_dir, "android", "app", "build", "outputs")]
     else:
         logs.append("Detected: Ionic + Cordova")
-        await run_cmd("npm install -g cordova", timeout=300)
+        await run_cmd("npm install -g cordova", timeout=None)
         android_platform = os.path.join(project_dir, "platforms", "android")
         if not os.path.isdir(android_platform):
-            code, out, err = await run_cmd("ionic cordova platform add android", cwd=project_dir, timeout=300)
+            code, out, err = await run_cmd("ionic cordova platform add android", cwd=project_dir, timeout=None)
             logs.append(f"platform add: {'OK' if code == 0 else 'FAIL'}")
             if code != 0:
                 return {"success": False, "error": f"Gagal tambah platform\n{err}\n{out}", "logs": logs}
         if os.path.isdir(android_platform):
             await fix_common_issues(android_platform, logs)
         _force_unsigned_release(android_platform, logs)
-        code, out, err = await run_cmd("ionic cordova build android --prod", cwd=project_dir, timeout=900)
+        code, out, err = await run_cmd("ionic cordova build android --prod", cwd=project_dir, timeout=None)
         logs.append(f"ionic cordova build: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
             return {"success": False, "error": f"Ionic Cordova build gagal\n{err}\n{out}", "logs": logs}
@@ -2341,11 +2348,11 @@ async def build_capacitor(project_dir, config):
     ok = await _install_node_deps(project_dir, logs)
     if not ok:
         return {"success": False, "error": "npm/yarn install gagal", "logs": logs}
-    code, out, err = await run_cmd("npx cap sync android", cwd=project_dir, timeout=300)
+    code, out, err = await run_cmd("npx cap sync android", cwd=project_dir, timeout=None)
     logs.append(f"cap sync: {'OK' if code == 0 else 'FAIL'}")
     android_dir = os.path.join(project_dir, "android")
     if not os.path.isdir(android_dir):
-        code, out, err = await run_cmd("npx cap add android", cwd=project_dir, timeout=300)
+        code, out, err = await run_cmd("npx cap add android", cwd=project_dir, timeout=None)
         logs.append(f"cap add android: {'OK' if code == 0 else 'FAIL'}")
         if code != 0:
             return {"success": False, "error": f"Gagal add platform android\n{err}\n{out}", "logs": logs}
